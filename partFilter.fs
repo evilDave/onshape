@@ -2,6 +2,15 @@ FeatureScript 3070;
 import(path : "onshape/std/common.fs", version : "3070.0");
 import(path : "onshape/std/queryVariable.fs", version : "3070.0");
 
+// Part Filter selects a reusable subset of solid bodies by bounding-box size or
+// spatial relationship to reference geometry. It tests each input body independently,
+// then can publish the matches as a robust query variable and/or delete non-matches.
+//
+// Bounding-box dimensions are explicit (direction, ranked dimension, any, or every)
+// to avoid ambiguous multiselect behaviour. Intersects includes touching, overlap,
+// and containment, while containment modes are strict and require solid references.
+// Empty inputs and results are valid; destructive operations are skipped when empty.
+
 export enum PartFilterQueryType
 {
     annotation { "Name" : "Bounding box length" }
@@ -167,7 +176,7 @@ function spatialRelationMatches(context is Context, part is Query, definition is
 
 annotation {
     "Feature Type Name" : "Part Filter",
-    "Feature Name Template" : "Part Filter: #variableName",
+    "Feature Name Template" : "#name",
     "UIHint" : UIHint.NO_PREVIEW_PROVIDED
 }
 export const partFilter = defineFeature(function(context is Context, id is Id, definition is map)
@@ -212,19 +221,41 @@ export const partFilter = defineFeature(function(context is Context, id is Id, d
             definition.spatialReference is Query;
         }
 
-        annotation {
-            "Name" : "Variable name",
-            "Default" : "filteredParts",
-            "MaxLength" : 10000,
-            "UIHint" : [UIHint.UNCONFIGURABLE, UIHint.QUERY_VARIABLE_NAME]
-        }
-        definition.variableName is string;
+        annotation { "Group Name" : "Outputs", "Collapsed By Default" : false }
+        {
+            annotation { "Name" : "Show selection", "Default" : true }
+            definition.showSelection is boolean;
 
-        annotation { "Name" : "Show selection", "Default" : true }
-        definition.showSelection is boolean;
+            annotation { "Name" : "Create or update query variable", "Default" : true }
+            definition.createQueryVariable is boolean;
+
+            if (definition.createQueryVariable)
+            {
+                annotation {
+                    "Name" : "Variable name",
+                    "Default" : "filteredParts",
+                    "MaxLength" : 10000,
+                    "UIHint" : [UIHint.UNCONFIGURABLE, UIHint.QUERY_VARIABLE_NAME]
+                }
+                definition.variableName is string;
+            }
+
+            annotation { "Name" : "Delete non-matching bodies", "Default" : false }
+            definition.deleteNonMatchingBodies is boolean;
+        }
     }
     {
-        verifyNonemptyQuery(context, definition, "parts", "Select parts to filter.");
+        var featureName = definition.createQueryVariable
+                ? definition.variableName
+                : "Part Filter";
+        if (definition.deleteNonMatchingBodies)
+        {
+            featureName ~= " (delete)";
+        }
+        setFeatureComputedParameter(context, id, {
+                    "name" : "name",
+                    "value" : featureName
+                });
 
         var direction;
         if (definition.queryType == PartFilterQueryType.BOUNDING_BOX_LENGTH &&
@@ -262,6 +293,7 @@ export const partFilter = defineFeature(function(context is Context, id is Id, d
         }
 
         var matchingParts = [];
+        var nonMatchingParts = [];
 
         for (var part in evaluateQuery(context, definition.parts))
         {
@@ -273,6 +305,10 @@ export const partFilter = defineFeature(function(context is Context, id is Id, d
             {
                 matchingParts = append(matchingParts, part);
             }
+            else
+            {
+                nonMatchingParts = append(nonMatchingParts, part);
+            }
         }
 
         var result = qNothing();
@@ -281,7 +317,10 @@ export const partFilter = defineFeature(function(context is Context, id is Id, d
             result = qUnion(makeRobustQueriesBatched(context, qUnion(matchingParts)));
         }
 
-        setQueryVariable(context, definition.variableName, "Parts matched by Part Filter", result);
+        if (definition.createQueryVariable)
+        {
+            setQueryVariable(context, definition.variableName, "Parts matched by Part Filter", result);
+        }
 
         if (definition.showSelection)
         {
@@ -291,4 +330,13 @@ export const partFilter = defineFeature(function(context is Context, id is Id, d
             }
         }
         setHighlightedEntities(context, { "entities" : result });
+
+        if (definition.deleteNonMatchingBodies && size(nonMatchingParts) > 0)
+        {
+            const nonMatchingResult =
+                    qUnion(makeRobustQueriesBatched(context, qUnion(nonMatchingParts)));
+            opDeleteBodies(context, id + "deleteNonMatchingBodies", {
+                        "entities" : nonMatchingResult
+                    });
+        }
     });
