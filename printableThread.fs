@@ -850,25 +850,41 @@ function borePointLocation(context is Context, location is Query, oppositeDirect
         };
 }
 
-function startChamferDimensions(radius is ValueWithUnits, width is ValueWithUnits, angle is ValueWithUnits) returns map
+function startChamferDimensions(radius is ValueWithUnits, width is ValueWithUnits, angle is ValueWithUnits, tapLength is ValueWithUnits) returns map
 {
     const slope = tan(angle);
     const outerRadius = radius + width / slope;
     const overlap = 0.05 * millimeter;
+    const zApex = outerRadius * slope;
+    const zEnd = min(zApex, tapLength);
+    const rBack = outerRadius + overlap / slope;
+    const rAtEnd = zEnd >= zApex - TOLERANCE.zeroLength * meter ? 0 * meter : rBack * (zApex - zEnd) / (zApex + overlap);
     return {
             "outerRadius" : outerRadius,
-            "zApex" : outerRadius * slope,
+            "zApex" : zApex,
+            "zEnd" : zEnd,
+            "rAtEnd" : rAtEnd,
             "overlap" : overlap,
-            "rBack" : outerRadius + overlap / slope
+            "rBack" : rBack
         };
 }
 
-function createStartChamfer(context is Context, id is Id, localCoordSys is CoordSystem, radius is ValueWithUnits, width is ValueWithUnits, angle is ValueWithUnits) returns Query
+function createStartChamfer(context is Context, id is Id, localCoordSys is CoordSystem, radius is ValueWithUnits, width is ValueWithUnits, angle is ValueWithUnits, tapLength is ValueWithUnits) returns Query
 {
-    const dims = startChamferDimensions(radius, width, angle);
+    const dims = startChamferDimensions(radius, width, angle, tapLength);
+    if (dims.rAtEnd > TOLERANCE.zeroLength * meter)
+    {
+        return revolveAxisProfile(context, id, localCoordSys, [
+                    vector(dims.rBack, -dims.overlap),
+                    vector(dims.rAtEnd, dims.zEnd),
+                    vector(0 * meter, dims.zEnd),
+                    vector(0 * meter, -dims.overlap),
+                    vector(dims.rBack, -dims.overlap)
+                ]);
+    }
     return revolveAxisProfile(context, id, localCoordSys, [
                 vector(dims.rBack, -dims.overlap),
-                vector(0 * meter, dims.zApex),
+                vector(0 * meter, dims.zEnd),
                 vector(0 * meter, -dims.overlap),
                 vector(dims.rBack, -dims.overlap)
             ]);
@@ -876,13 +892,36 @@ function createStartChamfer(context is Context, id is Id, localCoordSys is Coord
 
 function createCounterboreWithCone(context is Context, id is Id, localCoordSys is CoordSystem, zTop is ValueWithUnits, zBottom is ValueWithUnits, radius is ValueWithUnits, coneHeight is ValueWithUnits) returns Query
 {
+    const zLimit = 0 * meter;
     const zApex = zTop - coneHeight;
     const rInner = max(radius - coneHeight, 0 * meter);
+    if (zApex >= zLimit - TOLERANCE.zeroLength * meter)
+    {
+        return revolveAxisProfile(context, id, localCoordSys, [
+                    vector(radius, zBottom),
+                    vector(radius, zTop),
+                    vector(rInner, zApex),
+                    vector(0 * meter, zApex),
+                    vector(0 * meter, zBottom),
+                    vector(radius, zBottom)
+                ]);
+    }
+    if (zTop <= zLimit + TOLERANCE.zeroLength * meter)
+    {
+        return revolveAxisProfile(context, id, localCoordSys, [
+                    vector(radius, zBottom),
+                    vector(radius, zTop),
+                    vector(0 * meter, zTop),
+                    vector(0 * meter, zBottom),
+                    vector(radius, zBottom)
+                ]);
+    }
+    const rAtLimit = max(radius + ((zTop - zLimit) / coneHeight) * (rInner - radius), 0 * meter);
     return revolveAxisProfile(context, id, localCoordSys, [
                 vector(radius, zBottom),
                 vector(radius, zTop),
-                vector(rInner, zApex),
-                vector(0 * meter, zApex),
+                vector(rAtLimit, zLimit),
+                vector(0 * meter, zLimit),
                 vector(0 * meter, zBottom),
                 vector(radius, zBottom)
             ]);
@@ -1027,7 +1066,7 @@ function createThreadedTap(context is Context, id is Id, spec is map) returns Qu
             throw regenError("Start chamfer is larger than the hole depth.", ["startChamferWidth"]);
         }
         const entryRadius = threadRadiusAt(spec.startRadius, spec.endRadius, spec.height, 0 * meter, spec.threadClearance);
-        const chamfer = createStartChamfer(context, id + "startChamfer", localCoordSys, entryRadius, chamferWidth, spec.startChamferAngle);
+        const chamfer = createStartChamfer(context, id + "startChamfer", localCoordSys, entryRadius, chamferWidth, spec.startChamferAngle, tapLength);
         try
         {
             opBoolean(context, id + "startChamferUnion", {
@@ -1115,8 +1154,8 @@ function createThroughTapParts(context is Context, id is Id, spec is map)
     if (spec.startChamfer == true)
     {
         const entryRadius = threadRadiusAt(spec.startRadius, spec.endRadius, spec.height, 0 * meter, spec.threadClearance);
-        const chamferDims = startChamferDimensions(entryRadius, spec.startChamferWidth, spec.startChamferAngle);
-        const chamfer = createStartChamfer(context, id + "chamfer", localCoordSys, entryRadius, spec.startChamferWidth, spec.startChamferAngle);
+        const chamferDims = startChamferDimensions(entryRadius, spec.startChamferWidth, spec.startChamferAngle, tapLength);
+        const chamfer = createStartChamfer(context, id + "chamfer", localCoordSys, entryRadius, spec.startChamferWidth, spec.startChamferAngle, tapLength);
         setTapPartName(context, chamfer, "Through tap chamfer");
         addTapMateConnector(context, id + "chamferTop", localCoordSys.origin - chamferDims.overlap * localCoordSys.zAxis, localCoordSys.xAxis, localCoordSys.zAxis, chamfer);
     }
