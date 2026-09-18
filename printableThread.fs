@@ -524,23 +524,108 @@ function planeFromStopPick(context is Context, entity is Query) returns map
     return {};
 }
 
-function clipThreadSweepAtStopPlanes(context is Context, id is Id, sweep is Query, stopAt is Query, keepPoint is Vector) returns Query
+function sweepBoxInCSys(context is Context, body is Query, cSys is CoordSystem) returns map
+{
+    if (isQueryEmpty(context, body))
+    {
+        return {};
+    }
+    return {
+            "extent" : evBox3d(context, {
+                        "topology" : body,
+                        "cSys" : cSys,
+                        "tight" : true
+                    })
+        };
+}
+
+function sweepSpanContainsZ(extent is Box3d, z is ValueWithUnits) returns boolean
+{
+    return extent.minCorner[2] <= z && extent.maxCorner[2] >= z;
+}
+
+function sweepOverlapWithThread(extent is Box3d, height is ValueWithUnits) returns ValueWithUnits
+{
+    const lo = max(extent.minCorner[2], 0 * meter);
+    const hi = min(extent.maxCorner[2], height);
+    return max(hi - lo, 0 * meter);
+}
+
+function sweepBoxCenter(extent is Box3d, cSys is CoordSystem) returns Vector
+{
+    return toWorld(cSys, 0.5 * (extent.minCorner + extent.maxCorner));
+}
+
+function pickThreadedSweepSide(context is Context, front is Query, back is Query, localCoordSys is CoordSystem, height is ValueWithUnits, keepPoint is Vector) returns map
+{
+    const midZ = height / 2;
+    const frontFound = sweepBoxInCSys(context, front, localCoordSys);
+    const backFound = sweepBoxInCSys(context, back, localCoordSys);
+    const frontOk = frontFound.extent is Box3d;
+    const backOk = backFound.extent is Box3d;
+    if (frontOk && !backOk)
+    {
+        return { "keep" : front, "discard" : back };
+    }
+    if (backOk && !frontOk)
+    {
+        return { "keep" : back, "discard" : front };
+    }
+    if (!frontOk && !backOk)
+    {
+        return {};
+    }
+
+    const frontBox = frontFound.extent;
+    const backBox = backFound.extent;
+    const frontHasMid = sweepSpanContainsZ(frontBox, midZ);
+    const backHasMid = sweepSpanContainsZ(backBox, midZ);
+    if (frontHasMid && !backHasMid)
+    {
+        return { "keep" : front, "discard" : back };
+    }
+    if (backHasMid && !frontHasMid)
+    {
+        return { "keep" : back, "discard" : front };
+    }
+
+    const frontOverlap = sweepOverlapWithThread(frontBox, height);
+    const backOverlap = sweepOverlapWithThread(backBox, height);
+    if (frontOverlap > backOverlap + TOLERANCE.zeroLength * meter)
+    {
+        return { "keep" : front, "discard" : back };
+    }
+    if (backOverlap > frontOverlap + TOLERANCE.zeroLength * meter)
+    {
+        return { "keep" : back, "discard" : front };
+    }
+
+    const frontDist = norm(sweepBoxCenter(frontBox, localCoordSys) - keepPoint);
+    const backDist = norm(sweepBoxCenter(backBox, localCoordSys) - keepPoint);
+    if (frontDist <= backDist)
+    {
+        return { "keep" : front, "discard" : back };
+    }
+    return { "keep" : back, "discard" : front };
+}
+
+function clipThreadSweepAtStopPlanes(context is Context, id is Id, sweep is Query, stopAt is Query, localCoordSys is CoordSystem, height is ValueWithUnits) returns Query
 {
     if (!(stopAt is Query) || isQueryEmpty(context, stopAt) || isQueryEmpty(context, sweep))
     {
         return sweep;
     }
 
+    const keepPoint = localCoordSys.origin + height / 2 * localCoordSys.zAxis;
     var remaining = qOwnerBody(sweep);
     var missed = 0;
-    var index = 0;
+    var opIndex = 0;
     for (var entity in evaluateQuery(context, stopAt))
     {
         const picked = planeFromStopPick(context, entity);
         if (!(picked.plane is Plane))
         {
             missed += 1;
-            index += 1;
             continue;
         }
         const cutPlane = picked.plane;
@@ -555,12 +640,12 @@ function clipThreadSweepAtStopPlanes(context is Context, id is Id, sweep is Quer
         if (entirelyBehind || entirelyInFront)
         {
             missed += 1;
-            index += 1;
             continue;
         }
 
-        const planeId = id + "stopPlane" + index;
-        const splitId = id + "stopSplit" + index;
+        const stepId = id + "stop" + opIndex;
+        const planeId = stepId + "plane";
+        const splitId = stepId + "split";
         opPlane(context, planeId, {
                     "plane" : cutPlane
                 });
@@ -577,38 +662,33 @@ function clipThreadSweepAtStopPlanes(context is Context, id is Id, sweep is Quer
         {
             if (!isQueryEmpty(context, planeTool))
             {
-                opDeleteBodies(context, id + "stopPlaneDelete" + index, {
+                opDeleteBodies(context, stepId + "planeDelete", {
                             "entities" : planeTool
                         });
             }
             missed += 1;
-            index += 1;
+            opIndex += 1;
             continue;
         }
 
-        const keepInFront = dot(keepPoint - cutPlane.origin, cutPlane.normal) > 0;
         const back = qSplitBy(splitId, EntityType.BODY, true);
         const front = qSplitBy(splitId, EntityType.BODY, false);
-        if (isQueryEmpty(context, front) && isQueryEmpty(context, back))
+        const sides = pickThreadedSweepSide(context, front, back, localCoordSys, height, keepPoint);
+        if (!(sides.keep is Query) || isQueryEmpty(context, sides.keep))
         {
             missed += 1;
-            index += 1;
+            opIndex += 1;
             continue;
         }
 
-        const discard = keepInFront ? back : front;
-        const keep = keepInFront ? front : back;
-        if (!isQueryEmpty(context, discard))
+        if (sides.discard is Query && !isQueryEmpty(context, sides.discard))
         {
-            opDeleteBodies(context, id + "stopDiscard" + index, {
-                        "entities" : discard
+            opDeleteBodies(context, stepId + "discard", {
+                        "entities" : sides.discard
                     });
         }
-        if (!isQueryEmpty(context, keep))
-        {
-            remaining = keep;
-        }
-        index += 1;
+        remaining = sides.keep;
+        opIndex += 1;
     }
 
     if (missed == 1)
@@ -1778,8 +1858,7 @@ export const printableThread = defineFeature(function(context is Context, id is 
         var sweepTool = qCreatedBy(id + "sweep", EntityType.BODY);
         if (definition.stopAt is Query && !isQueryEmpty(context, definition.stopAt))
         {
-            const pinMid = localCoordSys.origin + height / 2 * localCoordSys.zAxis;
-            sweepTool = clipThreadSweepAtStopPlanes(context, id, sweepTool, definition.stopAt, pinMid);
+            sweepTool = clipThreadSweepAtStopPlanes(context, id, sweepTool, definition.stopAt, localCoordSys, height);
         }
 
         const doBore = definition.boreMatingPart == true;
