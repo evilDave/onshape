@@ -1,6 +1,7 @@
 FeatureScript 3070;
 import(path : "onshape/std/common.fs", version : "3070.0");
 import(path : "onshape/std/chamfertype.gen.fs", version : "3070.0");
+printableThreadIcon::import(path : "0bcd13a2640f002407a4b1c6", version : "3adc2e2d6ab96f6647b27cd3");
 
 /**
  * Cuts a triangular helical groove into a cylindrical or conical face.
@@ -1174,6 +1175,8 @@ function createThroughTapParts(context is Context, id is Id, spec is map)
 
 annotation {
     "Feature Type Name" : "Printable Thread",
+    "Icon" : printableThreadIcon::BLOB_DATA,
+    "UIHint" : UIHint.CONTROL_VISIBILITY,
     "Manipulator Change Function" : "printableThreadManipulatorChange",
     "Editing Logic Function" : "printableThreadEditLogic"
 }
