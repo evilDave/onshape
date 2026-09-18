@@ -505,6 +505,123 @@ function collidingSolids(context is Context, tool is Query, targets is Query) re
     return qUnion(evaluateQuery(context, qUnion(hits)));
 }
 
+function planeFromStopPick(context is Context, entity is Query) returns map
+{
+    const fromFace = try silent(evPlane(context, {
+                    "face" : entity
+                }));
+    if (fromFace is Plane)
+    {
+        return { "plane" : fromFace };
+    }
+    const mate = try silent(evMateConnector(context, {
+                    "mateConnector" : entity
+                }));
+    if (mate is CoordSystem)
+    {
+        return { "plane" : plane(mate.origin, mate.zAxis) };
+    }
+    return {};
+}
+
+function clipThreadSweepAtStopPlanes(context is Context, id is Id, sweep is Query, stopAt is Query, keepPoint is Vector) returns Query
+{
+    if (!(stopAt is Query) || isQueryEmpty(context, stopAt) || isQueryEmpty(context, sweep))
+    {
+        return sweep;
+    }
+
+    var remaining = qOwnerBody(sweep);
+    var missed = 0;
+    var index = 0;
+    for (var entity in evaluateQuery(context, stopAt))
+    {
+        const picked = planeFromStopPick(context, entity);
+        if (!(picked.plane is Plane))
+        {
+            missed += 1;
+            index += 1;
+            continue;
+        }
+        const cutPlane = picked.plane;
+
+        const boxResult = evBox3d(context, {
+                    "topology" : remaining,
+                    "cSys" : planeToCSys(cutPlane),
+                    "tight" : true
+                });
+        const entirelyBehind = boxResult.maxCorner[2] < TOLERANCE.zeroLength * meter;
+        const entirelyInFront = boxResult.minCorner[2] > -TOLERANCE.zeroLength * meter;
+        if (entirelyBehind || entirelyInFront)
+        {
+            missed += 1;
+            index += 1;
+            continue;
+        }
+
+        const planeId = id + "stopPlane" + index;
+        const splitId = id + "stopSplit" + index;
+        opPlane(context, planeId, {
+                    "plane" : cutPlane
+                });
+        const planeTool = qOwnerBody(qCreatedBy(planeId));
+        try
+        {
+            opSplitPart(context, splitId, {
+                        "targets" : remaining,
+                        "tool" : planeTool,
+                        "keepTools" : false
+                    });
+        }
+        catch
+        {
+            if (!isQueryEmpty(context, planeTool))
+            {
+                opDeleteBodies(context, id + "stopPlaneDelete" + index, {
+                            "entities" : planeTool
+                        });
+            }
+            missed += 1;
+            index += 1;
+            continue;
+        }
+
+        const keepInFront = dot(keepPoint - cutPlane.origin, cutPlane.normal) > 0;
+        const back = qSplitBy(splitId, EntityType.BODY, true);
+        const front = qSplitBy(splitId, EntityType.BODY, false);
+        if (isQueryEmpty(context, front) && isQueryEmpty(context, back))
+        {
+            missed += 1;
+            index += 1;
+            continue;
+        }
+
+        const discard = keepInFront ? back : front;
+        const keep = keepInFront ? front : back;
+        if (!isQueryEmpty(context, discard))
+        {
+            opDeleteBodies(context, id + "stopDiscard" + index, {
+                        "entities" : discard
+                    });
+        }
+        if (!isQueryEmpty(context, keep))
+        {
+            remaining = keep;
+        }
+        index += 1;
+    }
+
+    if (missed == 1)
+    {
+        reportFeatureWarning(context, id, "A stop selection does not cut the thread and was ignored.");
+    }
+    else if (missed > 1)
+    {
+        reportFeatureWarning(context, id, "Some stop selections do not cut the thread and were ignored.");
+    }
+    return remaining;
+}
+
 function depthAlongAxis(origin is Vector, zAxis is Vector, point is Vector, errorFields is array) returns ValueWithUnits
 {
     const depth = dot(point - origin, zAxis);
@@ -1191,6 +1308,13 @@ export const printableThread = defineFeature(function(context is Context, id is 
         definition.surface is Query;
 
         annotation {
+            "Name" : "Stop at",
+            "Description" : "Optional planes that stop the bolt thread so it does not cut into an attached face. The side that contains the threaded pin is kept.",
+            "Filter" : QueryFilterCompound.ALLOWS_PLANE
+        }
+        definition.stopAt is Query;
+
+        annotation {
             "Name" : "Dependent",
             "Default" : ThreadDependentParameter.FLAT,
             "UIHint" : UIHint.ALWAYS_HIDDEN
@@ -1651,6 +1775,13 @@ export const printableThread = defineFeature(function(context is Context, id is 
             throw regenError("Could not sweep the thread profile along the helix.");
         }
 
+        var sweepTool = qCreatedBy(id + "sweep", EntityType.BODY);
+        if (definition.stopAt is Query && !isQueryEmpty(context, definition.stopAt))
+        {
+            const pinMid = localCoordSys.origin + height / 2 * localCoordSys.zAxis;
+            sweepTool = clipThreadSweepAtStopPlanes(context, id, sweepTool, definition.stopAt, pinMid);
+        }
+
         const doBore = definition.boreMatingPart == true;
         const keepTap = definition.makeTap == true;
         if (doBore || keepTap)
@@ -1786,7 +1917,7 @@ export const printableThread = defineFeature(function(context is Context, id is 
         try
         {
             opBoolean(context, id + "cut", {
-                        "tools" : qCreatedBy(id + "sweep", EntityType.BODY),
+                        "tools" : sweepTool,
                         "targets" : part,
                         "operationType" : BooleanOperationType.SUBTRACTION
                     });
