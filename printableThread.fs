@@ -1881,6 +1881,77 @@ function threadLockFaces(bodyOrFace is Query) returns Query
         ]);
 }
 
+function createHelicalGroove(context is Context, id is Id, groove is map) returns Query
+{
+    const localCoordSys = groove.localCoordSys;
+    const length = groove.length;
+    const pitch = groove.pitch;
+    const extraRevs = groove.outerHalfWidth / pitch + 0.25;
+    const revolutions = length / pitch;
+    const helixStartRadius = groove.helixStartRadius;
+    const helixEndRadius = groove.helixEndRadius;
+    const startPoint = toWorld(localCoordSys, vector(helixStartRadius, 0 * meter, 0 * meter));
+
+    opHelix(context, id + "helix", {
+                "direction" : localCoordSys.zAxis,
+                "axisStart" : localCoordSys.origin,
+                "startPoint" : startPoint,
+                "interval" : [-extraRevs, revolutions + extraRevs],
+                "clockwise" : groove.leftHanded != true,
+                "helicalPitch" : pitch,
+                "spiralPitch" : revolutions == 0 ? 0 * meter : (helixEndRadius - helixStartRadius) / revolutions
+            });
+    const helixEdge = qCreatedBy(id + "helix", EntityType.EDGE);
+    const startTangent = evEdgeTangentLine(context, {
+                "edge" : helixEdge,
+                "parameter" : 0,
+                "arcLengthParameterization" : false
+            });
+    const intoMaterial = intoMaterialDirection(localCoordSys, startTangent.origin, groove.cutsInward == true);
+    const profile = newSketchOnPlane(context, id + "profile", {
+                "sketchPlane" : threadProfilePlane(startTangent.origin, intoMaterial, localCoordSys.zAxis)
+            });
+    skPolyline(profile, "profile", {
+                "points" : threadProfilePoints(groove.overlap, groove.depth, groove.outerHalfWidth, groove.rootHalfWidth, groove.truncation)
+            });
+    skSolve(profile);
+
+    const construction = qUnion([
+            qCreatedBy(id + "helix", EntityType.BODY),
+            qCreatedBy(id + "profile", EntityType.BODY)
+        ]);
+    try
+    {
+        var sweepDefinition = {
+                    "profiles" : qSketchRegion(id + "profile"),
+                    "path" : helixEdge
+                };
+        const lockFaces = threadLockFaces(groove.lockFrom);
+        if (!isQueryEmpty(context, lockFaces))
+        {
+            sweepDefinition.lockFaces = lockFaces;
+        }
+        opSweep(context, id + "sweep", sweepDefinition);
+    }
+    catch
+    {
+        opDeleteBodies(context, id + "deleteFailedConstruction", {
+                    "entities" : construction
+                });
+        throw regenError("Could not sweep the helical groove.");
+    }
+    opDeleteBodies(context, id + "deleteConstruction", {
+                "entities" : construction
+            });
+
+    var sweepBody = qCreatedBy(id + "sweep", EntityType.BODY);
+    if (groove.clipToFace == true)
+    {
+        sweepBody = clipThreadSweepToFace(context, id + "faceClip", sweepBody, localCoordSys, length);
+    }
+    return sweepBody;
+}
+
 function tapMatchesInternal(spec is map) returns boolean
 {
     return spec.cutsInward == false;
@@ -1905,68 +1976,23 @@ function createThreadedTap(context is Context, id is Id, spec is map) returns Qu
 {
     const localCoordSys = spec.localCoordSys;
     const tapLength = spec.tapLength;
-    const tapRevs = tapLength / spec.pitch;
-    const tapEndRadius = tapHelixRadiusAt(spec, tapLength);
     var tap = createTapStock(context, id + "stock", localCoordSys, spec.startRadius, spec.endRadius, spec.height, tapLength, spec.threadClearance);
-    const lockFaces = threadLockFaces(qOwnedByBody(tap, EntityType.FACE));
-    opHelix(context, id + "helix", {
-                "direction" : localCoordSys.zAxis,
-                "axisStart" : localCoordSys.origin,
-                "startPoint" : toWorld(localCoordSys, vector(spec.startRadius + spec.threadClearance, 0 * meter, 0 * meter)),
-                "interval" : [-spec.extraRevs, tapRevs + spec.extraRevs],
-                "clockwise" : !spec.leftHanded,
-                "helicalPitch" : spec.pitch,
-                "spiralPitch" : tapRevs == 0 ? 0 * meter : (tapEndRadius - (spec.startRadius + spec.threadClearance)) / tapRevs
+    const sweepBody = createHelicalGroove(context, id, {
+                "localCoordSys" : localCoordSys,
+                "length" : tapLength,
+                "helixStartRadius" : spec.startRadius + spec.threadClearance,
+                "helixEndRadius" : tapHelixRadiusAt(spec, tapLength),
+                "cutsInward" : spec.cutsInward == true,
+                "clipToFace" : tapMatchesInternal(spec),
+                "lockFrom" : tap,
+                "pitch" : spec.pitch,
+                "depth" : spec.depth,
+                "truncation" : spec.truncation,
+                "overlap" : spec.overlap,
+                "outerHalfWidth" : spec.outerHalfWidth,
+                "rootHalfWidth" : spec.rootHalfWidth,
+                "leftHanded" : spec.leftHanded == true
             });
-    const tapHelixEdge = qCreatedBy(id + "helix", EntityType.EDGE);
-    const tapStartTangent = evEdgeTangentLine(context, {
-                "edge" : tapHelixEdge,
-                "parameter" : 0,
-                "arcLengthParameterization" : false
-            });
-    const tapIntoMaterial = intoMaterialDirection(localCoordSys, tapStartTangent.origin, spec.cutsInward);
-    const tapProfile = newSketchOnPlane(context, id + "profile", {
-                "sketchPlane" : threadProfilePlane(tapStartTangent.origin, tapIntoMaterial, localCoordSys.zAxis)
-            });
-    skPolyline(tapProfile, "profile", {
-                "points" : threadProfilePoints(spec.overlap, spec.depth, spec.outerHalfWidth, spec.rootHalfWidth, spec.truncation)
-            });
-    skSolve(tapProfile);
-
-    try
-    {
-        var tapSweep = {
-                    "profiles" : qSketchRegion(id + "profile"),
-                    "path" : tapHelixEdge
-                };
-        if (!isQueryEmpty(context, lockFaces))
-        {
-            tapSweep.lockFaces = lockFaces;
-        }
-        opSweep(context, id + "sweep", tapSweep);
-    }
-    catch
-    {
-        opDeleteBodies(context, id + "deleteFailedConstruction", {
-                    "entities" : qUnion([
-                            qCreatedBy(id + "helix", EntityType.BODY),
-                            qCreatedBy(id + "profile", EntityType.BODY)
-                        ])
-                });
-        throw regenError("Could not sweep the tap thread profile.");
-    }
-    opDeleteBodies(context, id + "deleteConstruction", {
-                "entities" : qUnion([
-                        qCreatedBy(id + "helix", EntityType.BODY),
-                        qCreatedBy(id + "profile", EntityType.BODY)
-                    ])
-            });
-
-    var sweepBody = qCreatedBy(id + "sweep", EntityType.BODY);
-    if (tapMatchesInternal(spec))
-    {
-        sweepBody = clipThreadSweepToFace(context, id + "trim", sweepBody, localCoordSys, tapLength);
-    }
 
     try
     {
@@ -2257,70 +2283,24 @@ function createThreadedDie(context is Context, id is Id, spec is map) returns Qu
 {
     const localCoordSys = spec.localCoordSys;
     const dieLength = spec.dieLength;
-    const dieRevs = dieLength / spec.pitch;
-    const innerStart = dieHelixRadiusAt(spec, 0 * meter);
-    const innerEnd = dieHelixRadiusAt(spec, dieLength);
     const crestStart = dieCrestRadiusAt(spec, 0 * meter);
     var die = createDieStock(context, id + "stock", localCoordSys, spec, dieLength, resolvedDieOuterRadius(spec));
-    const lockFaces = threadLockFaces(qOwnedByBody(die, EntityType.FACE));
-    opHelix(context, id + "helix", {
-                "direction" : localCoordSys.zAxis,
-                "axisStart" : localCoordSys.origin,
-                "startPoint" : toWorld(localCoordSys, vector(innerStart, 0 * meter, 0 * meter)),
-                "interval" : [-spec.extraRevs, dieRevs + spec.extraRevs],
-                "clockwise" : !spec.leftHanded,
-                "helicalPitch" : spec.pitch,
-                "spiralPitch" : dieRevs == 0 ? 0 * meter : (innerEnd - innerStart) / dieRevs
+    const sweepBody = createHelicalGroove(context, id, {
+                "localCoordSys" : localCoordSys,
+                "length" : dieLength,
+                "helixStartRadius" : dieHelixRadiusAt(spec, 0 * meter),
+                "helixEndRadius" : dieHelixRadiusAt(spec, dieLength),
+                "cutsInward" : dieMatchesExternal(spec),
+                "clipToFace" : dieMatchesExternal(spec),
+                "lockFrom" : die,
+                "pitch" : spec.pitch,
+                "depth" : spec.depth,
+                "truncation" : spec.truncation,
+                "overlap" : spec.overlap,
+                "outerHalfWidth" : spec.outerHalfWidth,
+                "rootHalfWidth" : spec.rootHalfWidth,
+                "leftHanded" : spec.leftHanded == true
             });
-    const dieHelixEdge = qCreatedBy(id + "helix", EntityType.EDGE);
-    const dieStartTangent = evEdgeTangentLine(context, {
-                "edge" : dieHelixEdge,
-                "parameter" : 0,
-                "arcLengthParameterization" : false
-            });
-    const dieIntoMaterial = intoMaterialDirection(localCoordSys, dieStartTangent.origin, dieMatchesExternal(spec));
-    const dieProfile = newSketchOnPlane(context, id + "profile", {
-                "sketchPlane" : threadProfilePlane(dieStartTangent.origin, dieIntoMaterial, localCoordSys.zAxis)
-            });
-    skPolyline(dieProfile, "profile", {
-                "points" : threadProfilePoints(spec.overlap, spec.depth, spec.outerHalfWidth, spec.rootHalfWidth, spec.truncation)
-            });
-    skSolve(dieProfile);
-
-    try
-    {
-        var dieSweep = {
-                    "profiles" : qSketchRegion(id + "profile"),
-                    "path" : dieHelixEdge
-                };
-        if (!isQueryEmpty(context, lockFaces))
-        {
-            dieSweep.lockFaces = lockFaces;
-        }
-        opSweep(context, id + "sweep", dieSweep);
-    }
-    catch
-    {
-        opDeleteBodies(context, id + "deleteFailedConstruction", {
-                    "entities" : qUnion([
-                            qCreatedBy(id + "helix", EntityType.BODY),
-                            qCreatedBy(id + "profile", EntityType.BODY)
-                        ])
-                });
-        throw regenError("Could not sweep the die thread profile.");
-    }
-    opDeleteBodies(context, id + "deleteConstruction", {
-                "entities" : qUnion([
-                        qCreatedBy(id + "helix", EntityType.BODY),
-                        qCreatedBy(id + "profile", EntityType.BODY)
-                    ])
-            });
-
-    var sweepBody = qCreatedBy(id + "sweep", EntityType.BODY);
-    if (dieMatchesExternal(spec))
-    {
-        sweepBody = clipThreadSweepToFace(context, id + "trim", sweepBody, localCoordSys, dieLength);
-    }
 
     try
     {
@@ -3322,7 +3302,6 @@ export const printableThread = defineFeature(function(context is Context, id is 
         const truncation = dims.truncation;
         const dependent = dims.dependentParameter;
         const specifiedFields = specifiedThreadFields(dependent);
-        const revolutions = height / pitch;
         const smallestRadius = min(oriented.startRadius, oriented.endRadius);
         const minCrest = max(pitch * 0.02, 0.02 * millimeter);
         const axialFlank = depth / tan(definition.wallAngle);
@@ -3400,55 +3379,22 @@ export const printableThread = defineFeature(function(context is Context, id is 
         const rootHalfWidth = halfWidths.rootHalfWidth;
         const extraRevs = outerHalfWidth / pitch + 0.25;
 
-        opHelix(context, id + "helix", {
-                    "direction" : localCoordSys.zAxis,
-                    "axisStart" : localCoordSys.origin,
-                    "startPoint" : startPoint,
-                    "interval" : [-extraRevs, revolutions + extraRevs],
-                    "clockwise" : !definition.leftHanded,
-                    "helicalPitch" : pitch,
-                    "spiralPitch" : (oriented.endRadius - oriented.startRadius) / revolutions
+        var sweepTool = createHelicalGroove(context, id, {
+                    "localCoordSys" : localCoordSys,
+                    "length" : height,
+                    "helixStartRadius" : oriented.startRadius,
+                    "helixEndRadius" : oriented.endRadius,
+                    "cutsInward" : cutsInward,
+                    "clipToFace" : primaryIsInternal,
+                    "lockFrom" : face,
+                    "pitch" : pitch,
+                    "depth" : depth,
+                    "truncation" : truncation,
+                    "overlap" : overlap,
+                    "outerHalfWidth" : outerHalfWidth,
+                    "rootHalfWidth" : rootHalfWidth,
+                    "leftHanded" : definition.leftHanded == true
                 });
-
-        const helixEdge = qCreatedBy(id + "helix", EntityType.EDGE);
-        const startTangent = evEdgeTangentLine(context, {
-                    "edge" : helixEdge,
-                    "parameter" : 0,
-                    "arcLengthParameterization" : false
-                });
-        const intoMaterial = intoMaterialDirection(localCoordSys, startTangent.origin, cutsInward);
-        const profilePlane = threadProfilePlane(startTangent.origin, intoMaterial, localCoordSys.zAxis);
-        const profile = newSketchOnPlane(context, id + "profile", {
-                    "sketchPlane" : profilePlane
-                });
-        skPolyline(profile, "profile", {
-                    "points" : threadProfilePoints(overlap, depth, outerHalfWidth, rootHalfWidth, truncation)
-                });
-        skSolve(profile);
-
-        try
-        {
-            var sweepDefinition = {
-                        "profiles" : qSketchRegion(id + "profile"),
-                        "path" : helixEdge
-                    };
-            const lockFaces = threadLockFaces(face);
-            if (!isQueryEmpty(context, lockFaces))
-            {
-                sweepDefinition.lockFaces = lockFaces;
-            }
-            opSweep(context, id + "sweep", sweepDefinition);
-        }
-        catch
-        {
-            throw regenError("Could not sweep the thread profile along the helix.");
-        }
-
-        var sweepTool = qCreatedBy(id + "sweep", EntityType.BODY);
-        if (primaryIsInternal)
-        {
-            sweepTool = clipThreadSweepToFace(context, id + "faceClip", sweepTool, localCoordSys, height);
-        }
         if (definition.stopAt is Query && !isQueryEmpty(context, definition.stopAt))
         {
             sweepTool = clipThreadSweepAtStopPlanes(context, id, sweepTool, definition.stopAt, localCoordSys, height);
@@ -3572,13 +3518,6 @@ export const printableThread = defineFeature(function(context is Context, id is 
                 createThroughDieParts(context, id + "throughDie", throughDie);
             }
         }
-
-        opDeleteBodies(context, id + "deleteConstruction", {
-                    "entities" : qUnion([
-                            qCreatedBy(id + "helix", EntityType.BODY),
-                            qCreatedBy(id + "profile", EntityType.BODY)
-                        ])
-                });
     }, {
             "name" : "Printable Thread",
             "borePoints" : [],
