@@ -12,6 +12,10 @@ _Avoid_: surface
 The swept triangular solid that forms the thread. The primary cut, tap, and die share one helical groove.
 _Avoid_: thread cutter, thread form
 
+**Helix start**:
+The ray from the thread axis toward the part studio −X (or −Y if the axis is along X) where the helical groove begins on the Primary thread. The kept Tap and Die use this same ray.
+_Avoid_: phase zero, cylinder seam, start point
+
 **Thread form**:
 The 2D triangular profile swept along the helix.
 _Avoid_: profile
@@ -61,7 +65,7 @@ The radial offset on the complementary Tap or Die so a Mating location fits the 
 _Avoid_: gap, tolerance
 
 **Clock**:
-An angular offset of helix phase at a Location, relative to the Primary thread.
+An angular offset of helix phase at a Location, relative to the Helix start of the Primary thread.
 _Avoid_: rotation, twist
 
 **Opposite**:

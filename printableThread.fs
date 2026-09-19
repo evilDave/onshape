@@ -183,6 +183,23 @@ function requireThreadFace(context is Context, faceQuery is Query) returns Query
     return face;
 }
 
+function threadHelixStartX(z is Vector) returns Vector
+{
+    // Helix starts on part-studio -X (or -Y if the axis is along X), not the face seam.
+    const axis = normalize(z);
+    var reference = vector(-1, 0, 0);
+    if (abs(dot(axis, reference)) > 0.999)
+    {
+        reference = vector(0, -1, 0);
+    }
+    return normalize(reference - axis * dot(reference, axis));
+}
+
+function threadAxisCoordSystem(origin is Vector, z is Vector) returns CoordSystem
+{
+    return coordSystem(origin, threadHelixStartX(z), z);
+}
+
 function threadSurfaceFrame(context is Context, face is Query, oppositeDirection is boolean) returns map
 {
     var surface;
@@ -238,7 +255,7 @@ function threadSurfaceFrame(context is Context, face is Query, oppositeDirection
     }
 
     return {
-            "localCoordSys" : localCoordSys,
+            "localCoordSys" : threadAxisCoordSystem(localCoordSys.origin, localCoordSys.zAxis),
             "startRadius" : startRadius,
             "endRadius" : endRadius,
             "height" : height
@@ -312,7 +329,7 @@ function planarLocationPlacement(context is Context, face is Query, oppositeDire
     {
         z *= -1;
     }
-    const xAxis = perpendicularVector(z);
+    const xAxis = threadHelixStartX(z);
     var origin;
     if (axis is Line)
     {
@@ -1231,7 +1248,7 @@ function alignGeneratedPlacement(spec is map, locatedCSys is CoordSystem) return
     x = x - dot(x, z) * z;
     if (squaredNorm(x) <= TOLERANCE.zeroLength * TOLERANCE.zeroLength)
     {
-        x = perpendicularVector(z);
+        x = threadHelixStartX(z);
     }
     else
     {
@@ -1245,30 +1262,6 @@ function alignGeneratedPlacement(spec is map, locatedCSys is CoordSystem) return
     return {
             "coordSystem" : coordSystem(locatedCSys.origin, x, z),
             "leftHanded" : spec.leftHanded == true
-        };
-}
-
-function oppositeEndThreadFrame(generatorCSys is CoordSystem, length is ValueWithUnits, pitch is ValueWithUnits, leftHanded is boolean, alignHalfTurn is boolean) returns map
-{
-    const origin = generatorCSys.origin + length * generatorCSys.zAxis;
-    const z = -generatorCSys.zAxis;
-    var x = helixXAtAxial(generatorCSys, pitch, leftHanded, length);
-    x = x - dot(x, z) * z;
-    if (squaredNorm(x) <= TOLERANCE.zeroLength * TOLERANCE.zeroLength)
-    {
-        x = perpendicularVector(z);
-    }
-    else
-    {
-        x = normalize(x);
-    }
-    if (alignHalfTurn)
-    {
-        x = -x;
-    }
-    return {
-            "coordSystem" : coordSystem(origin, x, z),
-            "leftHanded" : leftHanded
         };
 }
 
@@ -1684,7 +1677,7 @@ function borePointLocation(context is Context, location is Query, oppositeDirect
     {
         axis.direction *= -1;
     }
-    const xAxis = perpendicularVector(axis.direction);
+    const xAxis = threadHelixStartX(axis.direction);
     const resolved = resolveBoreOwner(context, qNothing(), location, axis.origin, exclude, primaryStock);
     return {
             "coordSystem" : coordSystem(axis.origin, xAxis, axis.direction),
@@ -2354,10 +2347,16 @@ function createThroughDieParts(context is Context, id is Id, spec is map)
 
     if (spec.endChamfer == true)
     {
-        const crestStart = dieCrestRadiusAt(spec, 0 * meter);
-        const chamfer = createDieEndChamfer(context, id + "chamfer", localCoordSys, crestStart, spec.endChamferWidth, spec.endChamferAngle);
+        var chamferCSys = localCoordSys;
+        var chamferRadius = dieCrestRadiusAt(spec, 0 * meter);
+        if (spec.endChamferAtFarEnd == true)
+        {
+            chamferCSys = coordSystem(localCoordSys.origin + dieLength * localCoordSys.zAxis, localCoordSys.xAxis, -localCoordSys.zAxis);
+            chamferRadius = dieCrestRadiusAt(spec, dieLength);
+        }
+        const chamfer = createDieEndChamfer(context, id + "chamfer", chamferCSys, chamferRadius, spec.endChamferWidth, spec.endChamferAngle);
         setTapPartName(context, chamfer, spec.namePrefix is string ? spec.namePrefix ~ " External Through Die Chamfer" : "External Through Die Chamfer");
-        addTapMateConnector(context, id + "chamferTop", localCoordSys.origin, localCoordSys.xAxis, localCoordSys.zAxis, chamfer);
+        addTapMateConnector(context, id + "chamferTop", chamferCSys.origin, chamferCSys.xAxis, chamferCSys.zAxis, chamfer);
     }
 }
 
@@ -2619,12 +2618,11 @@ function keepThreadTool(context is Context, definition is map, spec is map, keep
         const dieForm = definition.keptDieForm is KeptDieForm ? definition.keptDieForm : KeptDieForm.THREAD;
         if (keptDieWantsThread(dieForm))
         {
-            const dieFrame = oppositeEndThreadFrame(faceCSys, length, spec.pitch, spec.leftHanded == true, spec.alignHalfTurn == true);
             var savedDie = spec;
-            savedDie.localCoordSys = dieFrame.coordSystem;
-            savedDie.leftHanded = dieFrame.leftHanded;
+            savedDie.localCoordSys = threadToolCoordSystem(faceCSys, savedDie);
             savedDie = setThreadToolLength(savedDie, length);
             savedDie.fitThreadOnly = true;
+            savedDie.endChamferAtFarEnd = true;
             savedDie.partName = prefixedPartName(definition, "External Die");
             savedDie.addMate = true;
             const die = buildPlacedThreadTool(context, featureId + "die", savedDie);
@@ -2632,12 +2630,11 @@ function keepThreadTool(context is Context, definition is map, spec is map, keep
         }
         if (keptDieWantsThrough(dieForm))
         {
-            const throughDieFrame = oppositeEndThreadFrame(faceCSys, length, spec.pitch, spec.leftHanded == true, spec.alignHalfTurn == true);
             var throughDie = spec;
-            throughDie.localCoordSys = throughDieFrame.coordSystem;
-            throughDie.leftHanded = throughDieFrame.leftHanded;
+            throughDie.localCoordSys = threadToolCoordSystem(faceCSys, throughDie);
             throughDie = setThreadToolLength(throughDie, definition.maxTapLength);
             throughDie.fitThreadOnly = true;
+            throughDie.endChamferAtFarEnd = true;
             throughDie.namePrefix = namePrefix;
             const offset = threadToolIsolateOffset(throughDie.localCoordSys);
             createThroughDieParts(context, featureId + "throughDie", offsetThreadToolFrame(throughDie, offset));

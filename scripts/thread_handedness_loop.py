@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Red-capable loop: Opposite / Location Z must not change physical handedness.
 
-Mirrors printableThread.fs helixXAtAxial, alignGeneratedPlacement, and
-oppositeEndThreadFrame. Mechanical right-hand: looking along a fixed world
-axis, the point turns clockwise as it advances along that axis.
-opHelix clockwise = !leftHanded, in the generation frame.
+Mirrors printableThread.fs helixXAtAxial, threadHelixStartX, and
+alignGeneratedPlacement. Mechanical right-hand:
+looking along a fixed world axis, the point turns clockwise as it advances
+along that axis. opHelix clockwise = !leftHanded, in the generation frame.
+Helix start is part-studio -X (or -Y if the axis is along X). The kept Die
+uses the start frame, same as apply.
 """
 
 from __future__ import annotations
@@ -64,6 +66,18 @@ def rotate_about(axis, angle, vec):
         add(scale(vec, c), scale(cross(axis, vec), s)),
         scale(axis, dot(axis, vec) * (1.0 - c)),
     )
+
+
+def thread_helix_start_x(z):
+    z = normalize(z)
+    reference = (-1.0, 0.0, 0.0)
+    if abs(dot(z, reference)) > 0.999:
+        reference = (0.0, -1.0, 0.0)
+    return normalize(sub(reference, scale(z, dot(reference, z))))
+
+
+def nearly_equal(a, b, tol=1e-9) -> bool:
+    return norm(sub(a, b)) <= tol
 
 
 def helix_x_at_axial(generator: Frame, pitch: float, left_handed: bool, along: float):
@@ -168,15 +182,42 @@ def main() -> int:
 
     die_frame, die_left = opposite_end_frame(primary, length, pitch, False, False)
     check(
-        "kept-die opposite-end frame: same handedness as definition",
+        "far-end frame: same handedness as definition",
         is_right_handed(die_frame, die_left, pitch, world_z),
+        failures,
+    )
+
+    check("Helix start on world Z is -X", nearly_equal(thread_helix_start_x(world_z), (-1.0, 0.0, 0.0)), failures)
+    check("Helix start on world -Z is -X", nearly_equal(thread_helix_start_x((0.0, 0.0, -1.0)), (-1.0, 0.0, 0.0)), failures)
+    check("Helix start on world X is -Y", nearly_equal(thread_helix_start_x((1.0, 0.0, 0.0)), (0.0, -1.0, 0.0)), failures)
+    seam_a = Frame((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), world_z)
+    seam_b = Frame((0.0, 0.0, 0.0), (0.0, 1.0, 0.0), world_z)
+    check(
+        "face seam X does not change Helix start",
+        nearly_equal(thread_helix_start_x(seam_a.z), thread_helix_start_x(seam_b.z)),
+        failures,
+    )
+    kept_die = Frame(primary.origin, thread_helix_start_x(primary.z), primary.z)
+    check("kept Die from the start shares Helix start", nearly_equal(kept_die.x, thread_helix_start_x(world_z)), failures)
+    other_pitch = pitch * 0.7
+    check(
+        "kept Die from the start does not clock when pitch changes",
+        nearly_equal(kept_die.x, thread_helix_start_x(world_z))
+        and nearly_equal(helix_x_at_axial(kept_die, other_pitch, False, 0.0), kept_die.x),
+        failures,
+    )
+    far_a = opposite_end_frame(primary, length, pitch, False, False)[0]
+    far_b = opposite_end_frame(primary, length, other_pitch, False, False)[0]
+    check(
+        "far-end frame clocks when pitch changes (the old keep path)",
+        not nearly_equal(far_a.x, far_b.x),
         failures,
     )
 
     if failures:
         print("\nRED: " + "; ".join(failures))
         return 1
-    print("\nGREEN: handedness is invariant under Opposite and Location Z.")
+    print("\nGREEN: handedness is invariant under Opposite and Location Z; Helix start is stable.")
     return 0
 
 
