@@ -1,6 +1,5 @@
 FeatureScript 3070;
 import(path : "onshape/std/common.fs", version : "3070.0");
-import(path : "onshape/std/chamfertype.gen.fs", version : "3070.0");
 printableThreadIcon::import(path : "0bcd13a2640f002407a4b1c6", version : "3adc2e2d6ab96f6647b27cd3");
 
 /**
@@ -123,7 +122,9 @@ export enum BoreEndType
     annotation { "Name" : "Up to part" }
     UP_TO_PART,
     annotation { "Name" : "Up to vertex" }
-    UP_TO_VERTEX
+    UP_TO_VERTEX,
+    annotation { "Name" : "Along face" }
+    ALONG_FACE
 }
 
 export enum KeptTapForm
@@ -244,6 +245,127 @@ function threadSurfaceFrame(context is Context, face is Query, oppositeDirection
         };
 }
 
+function maxCircularEdgeRadius(context is Context, face is Query) returns ValueWithUnits
+{
+    var radius = 0 * meter;
+    for (var edge in evaluateQuery(context, qGeometry(qAdjacent(face, AdjacencyType.EDGE), GeometryType.CIRCLE)))
+    {
+        const curve = try silent(evCurveDefinition(context, {
+                        "edge" : edge
+                    }));
+        if (curve is Circle)
+        {
+            radius = max(radius, curve.radius);
+        }
+    }
+    return radius;
+}
+
+function faceRadiusAboutAxis(context is Context, face is Query, origin is Vector, z is Vector) returns ValueWithUnits
+{
+    var radius = maxCircularEdgeRadius(context, face);
+    if (radius > TOLERANCE.zeroLength * meter)
+    {
+        return radius;
+    }
+    for (var vertex in evaluateQuery(context, qAdjacent(face, AdjacencyType.VERTEX)))
+    {
+        const point = evVertexPoint(context, {
+                    "vertex" : vertex
+                });
+        var radial = point - origin;
+        radial = radial - z * dot(radial, z);
+        radius = max(radius, norm(radial));
+    }
+    if (radius > TOLERANCE.zeroLength * meter)
+    {
+        return radius;
+    }
+    return radialExtentInCSys(context, face, coordSystem(origin, perpendicularVector(z), z));
+}
+
+function planarLocationPlacement(context is Context, face is Query, oppositeDirection is boolean, ownerHint is Query) returns map
+{
+    const surface = evSurfaceDefinition(context, {
+                "face" : face
+            });
+    if (!(surface is Plane))
+    {
+        throw regenError("Select a cylindrical, conical, or pin or boss end face.");
+    }
+    const tangent = evFaceTangentPlane(context, {
+                "face" : face,
+                "parameter" : vector(0.5, 0.5)
+            });
+    const plane = evPlane(context, {
+                "face" : face
+            });
+    const axis = try silent(evAxis(context, {
+                    "axis" : face
+                }));
+    var z = -tangent.normal;
+    if (axis is Line)
+    {
+        z = dot(axis.direction, -tangent.normal) >= 0 ? axis.direction : -axis.direction;
+    }
+    if (oppositeDirection)
+    {
+        z *= -1;
+    }
+    const xAxis = perpendicularVector(z);
+    var origin;
+    if (axis is Line)
+    {
+        origin = axis.origin - plane.normal * dot(axis.origin - plane.origin, plane.normal);
+    }
+    else
+    {
+        const cSys = coordSystem(plane.origin, xAxis, z);
+        const bounds = evBox3d(context, {
+                    "topology" : face,
+                    "cSys" : cSys,
+                    "tight" : true
+                });
+        origin = toWorld(cSys, vector(
+                        (bounds.minCorner[0] + bounds.maxCorner[0]) / 2,
+                        (bounds.minCorner[1] + bounds.maxCorner[1]) / 2,
+                        (bounds.minCorner[2] + bounds.maxCorner[2]) / 2
+                    ));
+    }
+    const radius = faceRadiusAboutAxis(context, face, origin, z);
+    if (radius <= TOLERANCE.zeroLength * meter)
+    {
+        throw regenError("Select a cylindrical, conical, or pin or boss end face.");
+    }
+    return {
+            "coordSystem" : coordSystem(origin, xAxis, z),
+            "faceRadius" : radius,
+            "ownerHint" : ownerHint
+        };
+}
+
+function locationFacePlacement(context is Context, location is Query, oppositeDirection is boolean) returns map
+{
+    const faces = evaluateQuery(context, qEntityFilter(location, EntityType.FACE));
+    if (size(faces) != 1)
+    {
+        throw regenError("Location is not a face.");
+    }
+    const face = faces[0];
+    const ownerHint = qOwnerBody(face);
+    const wall = try silent(threadSurfaceFrame(context, face, oppositeDirection));
+    if (wall is map)
+    {
+        return {
+                "coordSystem" : wall.localCoordSys,
+                "faceHeight" : wall.height,
+                "faceRadius" : max(wall.startRadius, wall.endRadius),
+                "ownerHint" : ownerHint
+            };
+    }
+    return planarLocationPlacement(context, face, oppositeDirection, ownerHint);
+}
+
 function radialAwayFromAxis(localCoordSys is CoordSystem, surfacePoint is Vector) returns Vector
 {
     const axial = localCoordSys.zAxis;
@@ -297,39 +419,6 @@ function detectPrimaryIsInternal(context is Context, faceQuery is Query) returns
     }
     const startPoint = toWorld(frame.localCoordSys, vector(frame.startRadius, 0 * meter, 0 * meter));
     return !threadCutsInward(context, face, frame.localCoordSys, startPoint);
-}
-
-function directedEndEdges(context is Context, face is Query, localCoordSys is CoordSystem, height is ValueWithUnits) returns Query
-{
-    const zTolerance = 0.01 * millimeter;
-    var edges = [];
-    for (var edge in evaluateQuery(context, qAdjacent(face, AdjacencyType.EDGE, EntityType.EDGE)))
-    {
-        const edgeBox = evBox3d(context, {
-                    "topology" : edge,
-                    "cSys" : localCoordSys,
-                    "tight" : true
-                });
-        if (abs(edgeBox.minCorner[2] - height) <= zTolerance && abs(edgeBox.maxCorner[2] - height) <= zTolerance)
-        {
-            edges = append(edges, edge);
-        }
-    }
-    if (size(edges) == 0)
-    {
-        throw regenError("Could not find an edge at the directed end to chamfer.", ["chamferEnd"]);
-    }
-    return qUnion(edges);
-}
-
-function chamferWidthOnFace(context is Context, edge is Query, threadFace is Query) returns boolean
-{
-    const faces = evaluateQuery(context, qAdjacent(edge, AdjacencyType.EDGE, EntityType.FACE));
-    if (size(faces) == 0)
-    {
-        return false;
-    }
-    return isQueryEmpty(context, qIntersection([faces[0], threadFace]));
 }
 
 function threadRadiusAt(startRadius is ValueWithUnits, endRadius is ValueWithUnits, height is ValueWithUnits, axial is ValueWithUnits, clearance is ValueWithUnits) returns ValueWithUnits
@@ -509,91 +598,6 @@ function createTapStock(context is Context, id is Id, localCoordSys is CoordSyst
             ]);
 }
 
-function ownerSolidOf(context is Context, selection is Query) returns Query
-{
-    var owner = qBodyType(selection, BodyType.SOLID);
-    if (!isQueryEmpty(context, owner))
-    {
-        return qUnion(evaluateQuery(context, owner));
-    }
-    owner = qBodyType(qOwnerBody(selection), BodyType.SOLID);
-    if (!isQueryEmpty(context, owner))
-    {
-        return qUnion(evaluateQuery(context, owner));
-    }
-    return qNothing();
-}
-
-function solidsOnHoleAxis(context is Context, exclude is Query, holeCSys is CoordSystem, holeRadius is ValueWithUnits) returns Query
-{
-    const axis = line(holeCSys.origin, holeCSys.zAxis);
-    var pins = [];
-    for (var solid in evaluateQuery(context, qSubtraction(qAllModifiableSolidBodies(), exclude)))
-    {
-        const closest = evDistance(context, {
-                    "side0" : solid,
-                    "side1" : axis
-                });
-        if (closest.distance <= holeRadius + 0.5 * millimeter)
-        {
-            pins = append(pins, solid);
-        }
-    }
-    if (size(pins) == 0)
-    {
-        return qNothing();
-    }
-    return qUnion(pins);
-}
-
-function solidsFromPartPicks(context is Context, picks is Query) returns Query
-{
-    return resolvePartPicks(context, picks, qNothing());
-}
-
-function resolvePartPicks(context is Context, picks is Query, exclude is Query) returns Query
-{
-    return resolvePartPicksAtHole(context, picks, exclude, coordSystem(vector(0, 0, 0) * meter, vector(1, 0, 0), vector(0, 0, 1)), -1 * meter);
-}
-
-function resolvePartPicksAtHole(context is Context, picks is Query, exclude is Query, holeCSys is CoordSystem, holeRadius is ValueWithUnits) returns Query
-{
-    if (!(picks is Query) || isQueryEmpty(context, picks))
-    {
-        return qNothing();
-    }
-    var solids = [];
-    for (var selection in evaluateQuery(context, picks))
-    {
-        var owner = ownerSolidOf(context, selection);
-        if (!isQueryEmpty(context, exclude) && !isQueryEmpty(context, qIntersection([owner, exclude])))
-        {
-            owner = qNothing();
-            const others = collidingSolids(context, qOwnerBody(selection), qSubtraction(qAllModifiableSolidBodies(), exclude));
-            if (!isQueryEmpty(context, others))
-            {
-                owner = others;
-            }
-            else if (holeRadius > 0 * meter)
-            {
-                owner = solidsOnHoleAxis(context, exclude, holeCSys, holeRadius);
-            }
-        }
-        if (!isQueryEmpty(context, owner))
-        {
-            for (var body in evaluateQuery(context, owner))
-            {
-                solids = append(solids, body);
-            }
-        }
-    }
-    if (size(solids) == 0)
-    {
-        return qNothing();
-    }
-    return qUnion(evaluateQuery(context, qUnion(solids)));
-}
-
 function radialExtentInCSys(context is Context, bodies is Query, cSys is CoordSystem) returns ValueWithUnits
 {
     var extent = 0 * meter;
@@ -609,185 +613,6 @@ function radialExtentInCSys(context is Context, bodies is Query, cSys is CoordSy
         extent = max(extent, sqrt(x * x + y * y));
     }
     return extent;
-}
-
-function pinAxialRange(context is Context, pin is Query, cSys is CoordSystem) returns map
-{
-    var zLo = 0 * meter;
-    var zHi = 0 * meter;
-    var has = false;
-    for (var vertex in evaluateQuery(context, qOwnedByBody(pin, EntityType.VERTEX)))
-    {
-        const point = evVertexPoint(context, {
-                    "vertex" : vertex
-                });
-        const z = fromWorld(cSys, point)[2];
-        if (!has)
-        {
-            zLo = z;
-            zHi = z;
-            has = true;
-        }
-        else
-        {
-            zLo = min(zLo, z);
-            zHi = max(zHi, z);
-        }
-    }
-    const boxResult = evBox3d(context, {
-                "topology" : pin,
-                "cSys" : cSys,
-                "tight" : false
-            });
-    if (!has)
-    {
-        zLo = boxResult.minCorner[2];
-        zHi = boxResult.maxCorner[2];
-    }
-    else
-    {
-        zLo = min(zLo, boxResult.minCorner[2]);
-        zHi = max(zHi, boxResult.maxCorner[2]);
-    }
-    return {
-            "zLo" : zLo,
-            "zHi" : zHi,
-            "length" : zHi - zLo
-        };
-}
-
-function holePinPlacement(context is Context, pin is Query, holeCSys is CoordSystem, height is ValueWithUnits) returns map
-{
-    const range = pinAxialRange(context, pin, holeCSys);
-    var zLo = range.zLo;
-    var zHi = range.zHi;
-    var pinLength = range.length;
-    if (pinLength <= 0.05 * millimeter)
-    {
-        const base = holeCSys.origin + height * holeCSys.zAxis;
-        const closest = evDistance(context, {
-                    "side0" : pin,
-                    "side1" : base
-                });
-        const tip = closest.sides[0].point;
-        const along = dot(tip - holeCSys.origin, holeCSys.zAxis);
-        zLo = along;
-        zHi = along + height;
-        pinLength = height;
-    }
-
-    const overlapStart = max(zLo, 0 * meter);
-    const overlapEnd = min(zHi, height);
-    const insertion = overlapEnd - overlapStart;
-    const tipIsHigh = abs(zHi - height) <= abs(zLo - height);
-    var originZ;
-    var axis = holeCSys.zAxis;
-    var dieLength;
-
-    if (insertion > 0.05 * millimeter)
-    {
-        dieLength = insertion;
-        if (tipIsHigh)
-        {
-            originZ = overlapEnd;
-            axis = -axis;
-        }
-        else
-        {
-            originZ = overlapStart;
-        }
-    }
-    else
-    {
-        dieLength = pinLength;
-        if (tipIsHigh)
-        {
-            originZ = zHi;
-            axis = -axis;
-        }
-        else
-        {
-            originZ = zLo;
-        }
-    }
-
-    return {
-            "coordSystem" : coordSystem(holeCSys.origin + originZ * holeCSys.zAxis, holeCSys.xAxis, axis),
-            "dieLength" : dieLength
-        };
-}
-
-function expandPinStock(context is Context, id is Id, pin is Query, localCoordSys is CoordSystem, dieLength is ValueWithUnits, minRadius is ValueWithUnits) returns Query
-{
-    const overlap = 0.05 * millimeter;
-    const stock = revolveAxisProfile(context, id + "stock", localCoordSys, [
-                vector(0 * meter, -overlap),
-                vector(minRadius, -overlap),
-                vector(minRadius, dieLength + overlap),
-                vector(0 * meter, dieLength + overlap),
-                vector(0 * meter, -overlap)
-            ]);
-    try
-    {
-        opBoolean(context, id + "union", {
-                    "tools" : qUnion([pin, stock]),
-                    "operationType" : BooleanOperationType.UNION
-                });
-    }
-    catch
-    {
-        opDeleteBodies(context, id + "deleteStock", {
-                    "entities" : stock
-                });
-        return pin;
-    }
-    const grown = qCreatedBy(id + "union", EntityType.BODY);
-    if (!isQueryEmpty(context, grown))
-    {
-        return grown;
-    }
-    return pin;
-}
-
-function clipPinAtHoleEnd(context is Context, id is Id, pin is Query, holeCSys is CoordSystem, height is ValueWithUnits) returns Query
-{
-    const range = pinAxialRange(context, pin, holeCSys);
-    if (range.zHi <= height + 0.05 * millimeter)
-    {
-        return pin;
-    }
-    return splitSweepKeepThread(context, id, pin, plane(holeCSys.origin + height * holeCSys.zAxis, holeCSys.zAxis), holeCSys, height);
-}
-
-function touchLegacyPartPickHelpers(context is Context, id is Id, pin is Query, holeCSys is CoordSystem, height is ValueWithUnits)
-{
-    if (!isQueryEmpty(context, pin))
-    {
-        const solids = solidsFromPartPicks(context, pin);
-        if (!isQueryEmpty(context, solids))
-        {
-            const placed = holePinPlacement(context, solids, holeCSys, height);
-            const grown = expandPinStock(context, id + "legacyGrow", solids, placed.coordSystem, placed.dieLength, 1 * millimeter);
-            clipPinAtHoleEnd(context, id + "legacyClip", grown, holeCSys, height);
-        }
-    }
-}
-
-function collidingSolids(context is Context, tool is Query, targets is Query) returns Query
-{
-    if (isQueryEmpty(context, targets))
-    {
-        return qNothing();
-    }
-    var hits = [];
-    for (var clash in evCollision(context, {
-                    "tools" : tool,
-                    "targets" : targets
-                }))
-    {
-        hits = append(hits, clash.targetBody);
-    }
-    return qUnion(evaluateQuery(context, qUnion(hits)));
 }
 
 function planeFromStopPick(context is Context, entity is Query) returns map
@@ -807,6 +632,51 @@ function planeFromStopPick(context is Context, entity is Query) returns map
         return { "plane" : plane(mate.origin, mate.zAxis) };
     }
     return {};
+}
+
+function axialPlaneHit(cutPlane is Plane, localCoordSys is CoordSystem) returns map
+{
+    const denom = dot(cutPlane.normal, localCoordSys.zAxis);
+    if (abs(denom) <= TOLERANCE.zeroAngle)
+    {
+        return {};
+    }
+    return {
+            "along" : dot(cutPlane.origin - localCoordSys.origin, cutPlane.normal) / denom
+        };
+}
+
+function definedThreadLength(context is Context, stopAt, localCoordSys is CoordSystem, height is ValueWithUnits) returns ValueWithUnits
+{
+    var length = height;
+    if (!(stopAt is Query) || isQueryEmpty(context, stopAt))
+    {
+        return length;
+    }
+    const mid = height / 2;
+    const endTolerance = TOLERANCE.zeroLength * meter;
+    for (var entity in evaluateQuery(context, stopAt))
+    {
+        const picked = planeFromStopPick(context, entity);
+        if (!(picked.plane is Plane))
+        {
+            continue;
+        }
+        const hit = axialPlaneHit(picked.plane, localCoordSys);
+        if (!(hit.along is ValueWithUnits))
+        {
+            continue;
+        }
+        if (hit.along <= endTolerance || hit.along >= height - endTolerance)
+        {
+            continue;
+        }
+        if (hit.along >= mid)
+        {
+            length = min(length, hit.along);
+        }
+    }
+    return length;
 }
 
 function sweepBoxInCSys(context is Context, body is Query, cSys is CoordSystem) returns map
@@ -955,6 +825,12 @@ function clipThreadSweepAtStopPlanes(context is Context, id is Id, sweep is Quer
             opIndex += 1;
             continue;
         }
+        if (!isQueryEmpty(context, planeTool))
+        {
+            opDeleteBodies(context, stepId + "planeDelete", {
+                        "entities" : planeTool
+                    });
+        }
 
         const back = qSplitBy(splitId, EntityType.BODY, true);
         const front = qSplitBy(splitId, EntityType.BODY, false);
@@ -1015,6 +891,12 @@ function splitSweepKeepThread(context is Context, id is Id, sweep is Query, cutP
                     });
         }
         return sweep;
+    }
+    if (!isQueryEmpty(context, planeTool))
+    {
+        opDeleteBodies(context, id + "planeDelete", {
+                    "entities" : planeTool
+                });
     }
     const back = qSplitBy(id + "split", EntityType.BODY, true);
     const front = qSplitBy(id + "split", EntityType.BODY, false);
@@ -1139,6 +1021,14 @@ function computeBoreDepth(context is Context, borePoint is map, located is map, 
             throw regenError("Select the part to bore up to.", ["pointEndEntity"]);
         }
         return firstFarRayDepth(context, endPart, origin, zAxis, ["pointEndEntity", "pointOpposite"]);
+    }
+    else if (borePoint.pointEndType == BoreEndType.ALONG_FACE)
+    {
+        if (!(located.faceHeight is ValueWithUnits))
+        {
+            throw regenError("Along face needs a cylindrical or conical Location.", ["pointEndType"]);
+        }
+        return located.faceHeight;
     }
     const vertices = evaluateQuery(context, qEntityFilter(borePoint.pointEndEntity, EntityType.VERTEX));
     if (size(vertices) != 1)
@@ -1351,10 +1241,10 @@ function alignGeneratedPlacement(spec is map, locatedCSys is CoordSystem) return
     {
         x = -x;
     }
-    const flipped = dot(z, generatorCSys.zAxis) < 0;
+    // Opposite and Location Z only choose the start end. Handedness stays the definition.
     return {
             "coordSystem" : coordSystem(locatedCSys.origin, x, z),
-            "leftHanded" : flipped ? spec.leftHanded != true : spec.leftHanded == true
+            "leftHanded" : spec.leftHanded == true
         };
 }
 
@@ -1378,7 +1268,7 @@ function oppositeEndThreadFrame(generatorCSys is CoordSystem, length is ValueWit
     }
     return {
             "coordSystem" : coordSystem(origin, x, z),
-            "leftHanded" : !leftHanded
+            "leftHanded" : leftHanded
         };
 }
 
@@ -1432,7 +1322,7 @@ function locationRoleLabel(known is boolean, primaryIsInternal is boolean, gener
 {
     if (known != true)
     {
-        return generated ? "Initial" : "Mating";
+        return generated ? "Primary thread" : "Mating thread";
     }
     if (generated)
     {
@@ -1480,20 +1370,6 @@ function joinLabels(labels is array) returns string
         text ~= labels[i];
     }
     return text;
-}
-
-function deleteCreatedSilent(context is Context, id is Id)
-{
-    try silent
-    {
-        const created = qCreatedBy(id);
-        if (!isQueryEmpty(context, created))
-        {
-            opDeleteBodies(context, id + "deleteFailed", {
-                        "entities" : created
-                    });
-        }
-    }
 }
 
 function wantsInternalCounterbore(definition is map) returns boolean
@@ -1644,7 +1520,7 @@ function syncBorePointSettings(context is Context, oldDefinition is map, definit
     {
         return definition;
     }
-    definition.borePoints = rematchHoleItems(context, locations, items, defaultBorePointSettings(threadLengthFromDefinition(context, definition), definition.boreOppositeDirection == true, "Hole"), "pointLocation", "pointKey", "pointLabel");
+    definition.borePoints = rematchHoleItems(context, locations, items, defaultBorePointSettings(threadLengthFromDefinition(context, definition), false, "Hole"), "pointLocation", "pointKey", "pointLabel");
     return definition;
 }
 
@@ -1677,7 +1553,7 @@ function syncGeneratedPointSettings(context is Context, oldDefinition is map, de
         return definition;
     }
     const isInternal = definition.primaryIsInternal == true;
-    definition.generatedPoints = rematchHoleItems(context, locations, items, defaultLocationPointSettings(definition, threadLengthFromDefinition(context, definition), definition.generatedOpposite == true, "Location", isInternal), "genLocation", "genKey", "genLabel");
+    definition.generatedPoints = rematchHoleItems(context, locations, items, defaultLocationPointSettings(definition, threadLengthFromDefinition(context, definition), false, "Location", isInternal), "genLocation", "genKey", "genLabel");
     return definition;
 }
 
@@ -1695,6 +1571,16 @@ function syncGeneratedClockSettings(context is Context, oldDefinition is map, de
     }
     definition.generatedClockPoints = rematchHoleItems(context, locations, items, defaultGeneratedClockSettings("Location"), "genClockLocation", "genClockKey", "genClockLabel");
     return definition;
+}
+
+function heldBodies(context is Context, bodies is Query) returns Query
+{
+    const found = evaluateQuery(context, qBodyType(bodies, BodyType.SOLID));
+    if (size(found) == 0)
+    {
+        return qNothing();
+    }
+    return qUnion(found);
 }
 
 function solidsExcept(context is Context, solids is Query, exclude is Query) returns Query
@@ -1722,36 +1608,74 @@ function solidsExcept(context is Context, solids is Query, exclude is Query) ret
     return qUnion(kept);
 }
 
-function resolveBoreOwner(context is Context, candidate is Query, location is Query, origin is Vector, exclude is Query) returns Query
+function chooseLocationOwner(context is Context, candidates is Query, primaryStock is Query) returns map
+{
+    const found = evaluateQuery(context, qBodyType(candidates, BodyType.SOLID));
+    if (size(found) == 0)
+    {
+        return { "owner" : qNothing(), "ambiguous" : false };
+    }
+    if (size(found) == 1)
+    {
+        return { "owner" : found[0], "ambiguous" : false };
+    }
+    var others = [];
+    for (var body in found)
+    {
+        if (isQueryEmpty(context, qIntersection([body, primaryStock])))
+        {
+            others = append(others, body);
+        }
+    }
+    if (size(others) == 1)
+    {
+        return { "owner" : others[0], "ambiguous" : false };
+    }
+    return { "owner" : qNothing(), "ambiguous" : true };
+}
+
+function resolveBoreOwner(context is Context, candidate is Query, location is Query, origin is Vector, exclude is Query, primaryStock is Query) returns map
 {
     const allowed = solidsExcept(context, qAllModifiableSolidBodies(), exclude);
-    var owner = solidsExcept(context, qUnion(evaluateQuery(context, qBodyType(candidate, BodyType.SOLID))), exclude);
-    if (!isQueryEmpty(context, owner))
-    {
-        return owner;
-    }
-    owner = solidsExcept(context, qUnion(evaluateQuery(context, qBodyType(qOwnerBody(location), BodyType.SOLID))), exclude);
-    if (!isQueryEmpty(context, owner))
-    {
-        return owner;
-    }
+    var claimed = [];
     for (var solid in evaluateQuery(context, allowed))
     {
         if (!isQueryEmpty(context, qIntersection([location, qMateConnectorsOfParts(solid)])))
         {
-            return solid;
+            claimed = append(claimed, solid);
         }
     }
-    owner = qClosestTo(allowed, origin);
-    if (isQueryEmpty(context, owner))
-    {
-        return qNothing();
-    }
-    return qUnion(evaluateQuery(context, owner));
+    const fromClaimed = size(claimed) > 0 ? qUnion(claimed) : qNothing();
+    const owner = qUnion([
+                solidsExcept(context, qUnion(evaluateQuery(context, qBodyType(candidate, BodyType.SOLID))), exclude),
+                fromClaimed,
+                solidsExcept(context, heldBodies(context, qOwnerBody(location)), exclude),
+                qClosestTo(allowed, origin)
+            ]);
+    return chooseLocationOwner(context, owner, primaryStock);
 }
 
-function borePointLocation(context is Context, location is Query, oppositeDirection is boolean, exclude is Query) returns map
+function borePointLocation(context is Context, location is Query, oppositeDirection is boolean, exclude is Query, primaryStock is Query) returns map
 {
+    const fromFace = try silent(locationFacePlacement(context, location, oppositeDirection));
+    if (fromFace is map)
+    {
+        const resolved = resolveBoreOwner(context, fromFace.ownerHint is Query ? fromFace.ownerHint : qNothing(), location, fromFace.coordSystem.origin, exclude, primaryStock);
+        var located = {
+                "coordSystem" : fromFace.coordSystem,
+                "owner" : resolved.owner,
+                "ambiguous" : resolved.ambiguous
+            };
+        if (fromFace.faceHeight is ValueWithUnits)
+        {
+            located.faceHeight = fromFace.faceHeight;
+        }
+        if (fromFace.faceRadius is ValueWithUnits)
+        {
+            located.faceRadius = fromFace.faceRadius;
+        }
+        return located;
+    }
     var axis = evAxis(context, {
                 "axis" : location,
                 "allowSketchPoints" : true
@@ -1761,21 +1685,46 @@ function borePointLocation(context is Context, location is Query, oppositeDirect
         axis.direction *= -1;
     }
     const xAxis = perpendicularVector(axis.direction);
+    const resolved = resolveBoreOwner(context, qNothing(), location, axis.origin, exclude, primaryStock);
     return {
             "coordSystem" : coordSystem(axis.origin, xAxis, axis.direction),
-            "owner" : resolveBoreOwner(context, qNothing(), location, axis.origin, exclude)
+            "owner" : resolved.owner,
+            "ambiguous" : resolved.ambiguous
         };
 }
 
-function placementTargets(context is Context, tool is Query, owner is Query, exclude is Query) returns Query
+function deleteCreatedSilent(context is Context, id is Id)
 {
-    const ignore = qUnion([exclude, tool, qOwnerBody(tool)]);
-    var candidates = solidsExcept(context, qAllModifiableSolidBodies(), ignore);
-    if (!isQueryEmpty(context, owner))
+    try silent
     {
-        candidates = qUnion([candidates, solidsExcept(context, owner, ignore)]);
+        const created = qCreatedBy(id);
+        if (!isQueryEmpty(context, created))
+        {
+            opDeleteBodies(context, id + "deleteFailed", {
+                        "entities" : created
+                    });
+        }
     }
-    return solidsExcept(context, collidingSolids(context, tool, candidates), ignore);
+}
+
+function subtractCreatedToolFromPart(context is Context, id is Id, createdTool is Query, part is Query)
+{
+    if (isQueryEmpty(context, createdTool) || isQueryEmpty(context, part) || size(evaluateQuery(context, qBodyType(part, BodyType.SOLID))) != 1)
+    {
+        throw regenError("No part to cut at this location.");
+    }
+    opBoolean(context, id + "place", {
+                "tools" : createdTool,
+                "targets" : part,
+                "operationType" : BooleanOperationType.SUBTRACTION,
+                "keepTools" : true
+            });
+    if (!isQueryEmpty(context, createdTool))
+    {
+        opDeleteBodies(context, id + "deleteTool", {
+                    "entities" : createdTool
+                });
+    }
 }
 
 function startChamferDimensions(radius is ValueWithUnits, width is ValueWithUnits, angle is ValueWithUnits, tapLength is ValueWithUnits) returns map
@@ -1866,6 +1815,12 @@ function fittedCounterboreBack(back is ValueWithUnits, tapLength is ValueWithUni
         throw regenError("Counterbore back is longer than the tap.", ["counterboreBack"]);
     }
     return max(tapLength - 0.05 * millimeter, 0 * meter);
+}
+
+function tapHelixLengthBeforeCounterbore(tapLength is ValueWithUnits, boreOverlap is ValueWithUnits, depth is ValueWithUnits) returns ValueWithUnits
+{
+    const clearance = 0.05 * millimeter;
+    return max(tapLength - boreOverlap - depth - clearance, 0 * meter);
 }
 
 function holeUsesCounterbore(specifyEnd is boolean, borePoint is map) returns boolean
@@ -1976,60 +1931,72 @@ function createThreadedTap(context is Context, id is Id, spec is map) returns Qu
 {
     const localCoordSys = spec.localCoordSys;
     const tapLength = spec.tapLength;
-    var tap = createTapStock(context, id + "stock", localCoordSys, spec.startRadius, spec.endRadius, spec.height, tapLength, spec.threadClearance);
-    const sweepBody = createHelicalGroove(context, id, {
-                "localCoordSys" : localCoordSys,
-                "length" : tapLength,
-                "helixStartRadius" : spec.startRadius + spec.threadClearance,
-                "helixEndRadius" : tapHelixRadiusAt(spec, tapLength),
-                "cutsInward" : spec.cutsInward == true,
-                "clipToFace" : tapMatchesInternal(spec),
-                "lockFrom" : tap,
-                "pitch" : spec.pitch,
-                "depth" : spec.depth,
-                "truncation" : spec.truncation,
-                "overlap" : spec.overlap,
-                "outerHalfWidth" : spec.outerHalfWidth,
-                "rootHalfWidth" : spec.rootHalfWidth,
-                "leftHanded" : spec.leftHanded == true
-            });
-
-    try
-    {
-        if (tapMatchesInternal(spec))
-        {
-            opBoolean(context, id + "cut", {
-                        "tools" : qUnion([tap, sweepBody]),
-                        "operationType" : BooleanOperationType.UNION
-                    });
-        }
-        else
-        {
-            opBoolean(context, id + "cut", {
-                        "tools" : sweepBody,
-                        "targets" : tap,
-                        "operationType" : BooleanOperationType.SUBTRACTION
-                    });
-        }
-    }
-    catch
-    {
-        throw regenError("Could not build the tap.");
-    }
-    const joinedTap = qCreatedBy(id + "cut", EntityType.BODY);
-    if (!isQueryEmpty(context, joinedTap))
-    {
-        tap = joinedTap;
-    }
-
-    if (spec.useCounterbore != false)
+    const useBore = spec.useCounterbore != false;
+    var helixLength = tapLength;
+    var boreOverlap = 0 * meter;
+    var cutoutEnd = tapLength;
+    if (useBore)
     {
         const counterboreBack = fittedCounterboreBack(spec.counterboreBack, tapLength, spec.strictCounterbore == true);
-        const boreOverlap = max(counterboreBack, 0.05 * millimeter);
-        const cutoutEnd = tapLength + spec.counterboreDeeper;
+        boreOverlap = max(counterboreBack, 0.05 * millimeter);
+        cutoutEnd = tapLength + spec.counterboreDeeper;
+        // Keep the helical groove off the counterbore cone; that union is phase-sensitive.
+        helixLength = tapHelixLengthBeforeCounterbore(tapLength, boreOverlap, spec.depth);
+    }
+    var tap = createTapStock(context, id + "stock", localCoordSys, spec.startRadius, spec.endRadius, spec.height, tapLength, spec.threadClearance);
+    if (helixLength > 0.05 * millimeter)
+    {
+        const sweepBody = createHelicalGroove(context, id, {
+                    "localCoordSys" : localCoordSys,
+                    "length" : helixLength,
+                    "helixStartRadius" : spec.startRadius + spec.threadClearance,
+                    "helixEndRadius" : tapHelixRadiusAt(spec, helixLength),
+                    "cutsInward" : spec.cutsInward == true,
+                    "clipToFace" : tapMatchesInternal(spec) || useBore,
+                    "lockFrom" : tap,
+                    "pitch" : spec.pitch,
+                    "depth" : spec.depth,
+                    "truncation" : spec.truncation,
+                    "overlap" : spec.overlap,
+                    "outerHalfWidth" : spec.outerHalfWidth,
+                    "rootHalfWidth" : spec.rootHalfWidth,
+                    "leftHanded" : spec.leftHanded == true
+                });
+
+        try
+        {
+            if (tapMatchesInternal(spec))
+            {
+                opBoolean(context, id + "cut", {
+                            "tools" : qUnion([tap, sweepBody]),
+                            "operationType" : BooleanOperationType.UNION
+                        });
+            }
+            else
+            {
+                opBoolean(context, id + "cut", {
+                            "tools" : sweepBody,
+                            "targets" : tap,
+                            "operationType" : BooleanOperationType.SUBTRACTION
+                        });
+            }
+        }
+        catch
+        {
+            throw regenError("Could not build the tap.");
+        }
+        const joinedTap = qCreatedBy(id + "cut", EntityType.BODY);
+        if (!isQueryEmpty(context, joinedTap))
+        {
+            tap = joinedTap;
+        }
+    }
+
+    if (useBore)
+    {
         if (cutoutEnd > tapLength - boreOverlap + TOLERANCE.zeroLength * meter)
         {
-            const cutout = createCounterboreWithCone(context, id + "counterbore", localCoordSys, tapLength - boreOverlap, cutoutEnd, tapMajorRadiusAt(spec, tapLength), spec.depth);
+            const cutout = createCounterboreWithCone(context, id + "counterbore", localCoordSys, tapLength - boreOverlap, cutoutEnd, tapMajorRadiusAt(spec, tapLength) + 0.05 * millimeter, spec.depth);
             try
             {
                 opBoolean(context, id + "bores", {
@@ -2088,7 +2055,7 @@ function createThreadedTap(context is Context, id is Id, spec is map) returns Qu
     {
         addTapMateConnector(context, id + "mate", localCoordSys.origin, localCoordSys.xAxis, localCoordSys.zAxis, tap);
     }
-    return tap;
+    return heldBodies(context, tap);
 }
 
 function addTapMateConnector(context is Context, id is Id, origin is Vector, xAxis is Vector, zAxis is Vector, owner is Query)
@@ -2337,7 +2304,14 @@ function createThreadedDie(context is Context, id is Id, spec is map) returns Qu
         {
             throw regenError("End chamfer is larger than the die length.", ["dieChamferWidth"]);
         }
-        const chamfer = createDieEndChamfer(context, id + "endChamfer", localCoordSys, crestStart, chamferWidth, spec.endChamferAngle);
+        var chamferCSys = localCoordSys;
+        var chamferRadius = crestStart;
+        if (spec.endChamferAtFarEnd == true)
+        {
+            chamferCSys = coordSystem(localCoordSys.origin + dieLength * localCoordSys.zAxis, localCoordSys.xAxis, -localCoordSys.zAxis);
+            chamferRadius = dieCrestRadiusAt(spec, dieLength);
+        }
+        const chamfer = createDieEndChamfer(context, id + "endChamfer", chamferCSys, chamferRadius, chamferWidth, spec.endChamferAngle);
         die = unionDieChamfer(context, id + "endChamferUnion", die, chamfer);
     }
 
@@ -2353,7 +2327,7 @@ function createThreadedDie(context is Context, id is Id, spec is map) returns Qu
     {
         addTapMateConnector(context, id + "mate", localCoordSys.origin, localCoordSys.xAxis, localCoordSys.zAxis, die);
     }
-    return die;
+    return heldBodies(context, die);
 }
 
 function keptDieWantsThrough(form) returns boolean
@@ -2387,126 +2361,10 @@ function createThroughDieParts(context is Context, id is Id, spec is map)
     }
 }
 
-function createHoleCounterboreDeeper(context is Context, id is Id, localCoordSys is CoordSystem, height is ValueWithUnits, deeper is ValueWithUnits, boreRadius is ValueWithUnits) returns Query
-{
-    const overlap = 0.05 * millimeter;
-    return revolveAxisProfile(context, id, localCoordSys, [
-                vector(0 * meter, height - overlap),
-                vector(boreRadius, height - overlap),
-                vector(boreRadius, height + deeper),
-                vector(0 * meter, height + deeper),
-                vector(0 * meter, height - overlap)
-            ]);
-}
-
-function createHoleCounterboreBack(context is Context, id is Id, localCoordSys is CoordSystem, height is ValueWithUnits, back is ValueWithUnits, boreRadius is ValueWithUnits, wallAngle is ValueWithUnits) returns Query
-{
-    const slope = tan(wallAngle);
-    const overlap = 0.05 * millimeter;
-    const zCyl = height - back;
-    const coneLength = slope > 0 ? boreRadius / slope : 0 * meter;
-    const zApex = zCyl - coneLength;
-    const zEnd = height + overlap;
-    if (zApex >= 0 * meter)
-    {
-        return revolveAxisProfile(context, id, localCoordSys, [
-                    vector(0 * meter, zApex),
-                    vector(boreRadius, zCyl),
-                    vector(boreRadius, zEnd),
-                    vector(0 * meter, zEnd),
-                    vector(0 * meter, zApex)
-                ]);
-    }
-    const rAtEntry = max(boreRadius - zCyl * slope, 0 * meter);
-    return revolveAxisProfile(context, id, localCoordSys, [
-                vector(0 * meter, 0 * meter),
-                vector(rAtEntry, 0 * meter),
-                vector(boreRadius, zCyl),
-                vector(boreRadius, zEnd),
-                vector(0 * meter, zEnd),
-                vector(0 * meter, 0 * meter)
-            ]);
-}
-
-function subtractHoleFinishTool(context is Context, id is Id, tool is Query, part is Query, errorFields is array) returns Query
-{
-    try
-    {
-        opBoolean(context, id + "cut", {
-                    "tools" : tool,
-                    "targets" : part,
-                    "operationType" : BooleanOperationType.SUBTRACTION
-                });
-    }
-    catch
-    {
-        throw regenError("Could not add the hole counterbore.", errorFields);
-    }
-    const bored = qOwnerBody(qCreatedBy(id + "cut", EntityType.FACE));
-    if (!isQueryEmpty(context, bored))
-    {
-        return bored;
-    }
-    return part;
-}
-
-function applyInternalHoleFinish(context is Context, id is Id, definition is map, part is Query, localCoordSys is CoordSystem, startRadius is ValueWithUnits, endRadius is ValueWithUnits, height is ValueWithUnits, depth is ValueWithUnits) returns Query
-{
-    var finished = part;
-    if (wantsInternalStartChamfer(definition))
-    {
-        const chamferWidth = internalStartChamferWidth(definition);
-        const chamferAngle = internalStartChamferAngle(definition);
-        if (chamferWidth >= height)
-        {
-            throw regenError("Start chamfer is larger than the hole depth.", ["startChamferWidth"]);
-        }
-        const entryRadius = threadRadiusAt(startRadius, endRadius, height, 0 * meter, 0 * meter);
-        const chamfer = createStartChamfer(context, id + "holeChamfer", localCoordSys, entryRadius, chamferWidth, chamferAngle, height);
-        try
-        {
-            opBoolean(context, id + "holeChamferCut", {
-                        "tools" : chamfer,
-                        "targets" : finished,
-                        "operationType" : BooleanOperationType.SUBTRACTION
-                    });
-        }
-        catch
-        {
-            throw regenError("Could not add the hole start chamfer.", ["startChamferWidth", "startChamferAngle"]);
-        }
-        const chamfered = qOwnerBody(qCreatedBy(id + "holeChamferCut", EntityType.FACE));
-        if (!isQueryEmpty(context, chamfered))
-        {
-            finished = chamfered;
-        }
-    }
-
-    if (wantsInternalCounterbore(definition))
-    {
-        const wallAngle = definition.wallAngle is ValueWithUnits ? definition.wallAngle : 45 * degree;
-        const holeEndRadius = threadRadiusAt(startRadius, endRadius, height, height, 0 * meter);
-        const boreRadius = holeEndRadius + depth;
-        const back = fittedCounterboreBack(internalCounterboreBack(definition), height, true);
-        const deeper = internalCounterboreDeeper(definition);
-        const errorFields = ["counterboreBack", "counterboreDeeper"];
-        if (deeper > TOLERANCE.zeroLength * meter)
-        {
-            const deeperTool = createHoleCounterboreDeeper(context, id + "holeDeeper", localCoordSys, height, deeper, boreRadius);
-            finished = subtractHoleFinishTool(context, id + "holeDeeper", deeperTool, finished, errorFields);
-        }
-        if (back > TOLERANCE.zeroLength * meter)
-        {
-            const backTool = createHoleCounterboreBack(context, id + "holeBack", localCoordSys, height, back, boreRadius, wallAngle);
-            finished = subtractHoleFinishTool(context, id + "holeBack", backTool, finished, errorFields);
-        }
-    }
-    return finished;
-}
-
 function tapSpecFromDefinition(definition is map, oriented is map, height is ValueWithUnits, pitch is ValueWithUnits, overlap is ValueWithUnits, extraRevs is number, outerHalfWidth is ValueWithUnits, rootHalfWidth is ValueWithUnits, truncation is ValueWithUnits, depth is ValueWithUnits, cutsInward is boolean, clearance is ValueWithUnits) returns map
 {
     return {
+            "tool" : "tap",
             "startRadius" : oriented.startRadius,
             "endRadius" : oriented.endRadius,
             "height" : height,
@@ -2529,9 +2387,10 @@ function tapSpecFromDefinition(definition is map, oriented is map, height is Val
         };
 }
 
-function dieSpecFromDefinition(definition is map, oriented is map, height is ValueWithUnits, pitch is ValueWithUnits, overlap is ValueWithUnits, extraRevs is number, outerHalfWidth is ValueWithUnits, rootHalfWidth is ValueWithUnits, truncation is ValueWithUnits, depth is ValueWithUnits, clearance is ValueWithUnits) returns map
+function dieSpecFromDefinition(definition is map, oriented is map, height is ValueWithUnits, pitch is ValueWithUnits, overlap is ValueWithUnits, extraRevs is number, outerHalfWidth is ValueWithUnits, rootHalfWidth is ValueWithUnits, truncation is ValueWithUnits, depth is ValueWithUnits, matchExternal is boolean, clearance is ValueWithUnits) returns map
 {
     return {
+            "tool" : "die",
             "startRadius" : oriented.startRadius,
             "endRadius" : oriented.endRadius,
             "height" : height,
@@ -2544,10 +2403,97 @@ function dieSpecFromDefinition(definition is map, oriented is map, height is Val
             "truncation" : truncation,
             "depth" : depth,
             "leftHanded" : definition.leftHanded == true,
+            "matchExternal" : matchExternal,
             "endChamfer" : wantsExternalEndChamfer(definition),
             "endChamferWidth" : externalChamferWidth(definition),
             "endChamferAngle" : externalChamferAngle(definition),
             "fitThreadOnly" : true
+        };
+}
+
+function threadToolIsDie(spec is map) returns boolean
+{
+    return spec.tool == "die";
+}
+
+function setThreadToolLength(spec is map, length is ValueWithUnits) returns map
+{
+    if (threadToolIsDie(spec))
+    {
+        spec.dieLength = length;
+    }
+    else
+    {
+        spec.tapLength = length;
+    }
+    return spec;
+}
+
+function buildThreadTool(context is Context, id is Id, spec is map) returns Query
+{
+    if (threadToolIsDie(spec))
+    {
+        return createThreadedDie(context, id, spec);
+    }
+    return createThreadedTap(context, id, spec);
+}
+
+function threadToolIsolateOffset(cSys is CoordSystem) returns Vector
+{
+    return 2 * meter * cSys.xAxis;
+}
+
+function offsetThreadToolFrame(spec is map, offset is Vector) returns map
+{
+    const cSys = spec.localCoordSys;
+    spec.localCoordSys = coordSystem(cSys.origin + offset, cSys.xAxis, cSys.zAxis);
+    return spec;
+}
+
+function moveThreadToolToPlace(context is Context, id is Id, bodies is Query, offset is Vector) returns Query
+{
+    if (isQueryEmpty(context, bodies))
+    {
+        return bodies;
+    }
+    opTransform(context, id, {
+                "bodies" : bodies,
+                "transform" : transform(-offset)
+            });
+    return bodies;
+}
+
+function buildPlacedThreadTool(context is Context, id is Id, spec is map) returns Query
+{
+    const offset = threadToolIsolateOffset(spec.localCoordSys);
+    const tool = buildThreadTool(context, id, offsetThreadToolFrame(spec, offset));
+    return moveThreadToolToPlace(context, id + "toPlace", tool, offset);
+}
+
+function stampThreadToolClock(spec is map, generatorCSys is CoordSystem) returns map
+{
+    spec.generatorCSys = generatorCSys;
+    spec.alignHalfTurn = false;
+    return spec;
+}
+
+function threadToolSpecs(definition is map, oriented is map, height is ValueWithUnits, pitch is ValueWithUnits, overlap is ValueWithUnits, extraRevs is number, outerHalfWidth is ValueWithUnits, rootHalfWidth is ValueWithUnits, truncation is ValueWithUnits, depth is ValueWithUnits, primaryIsInternal is boolean, matingClearance is ValueWithUnits, generatorCSys is CoordSystem) returns map
+{
+    var matching;
+    var complementary;
+    if (primaryIsInternal)
+    {
+        matching = tapSpecFromDefinition(definition, oriented, height, pitch, overlap, extraRevs, outerHalfWidth, rootHalfWidth, truncation, depth, false, 0 * meter);
+        complementary = dieSpecFromDefinition(definition, oriented, height, pitch, overlap, extraRevs, outerHalfWidth, rootHalfWidth, truncation, depth, false, matingClearance);
+    }
+    else
+    {
+        matching = dieSpecFromDefinition(definition, oriented, height, pitch, overlap, extraRevs, outerHalfWidth, rootHalfWidth, truncation, depth, true, 0 * meter);
+        complementary = tapSpecFromDefinition(definition, oriented, height, pitch, overlap, extraRevs, outerHalfWidth, rootHalfWidth, truncation, depth, true, matingClearance);
+    }
+    return {
+            "matching" : stampThreadToolClock(matching, generatorCSys),
+            "complementary" : stampThreadToolClock(complementary, generatorCSys)
         };
 }
 
@@ -2578,38 +2524,226 @@ function applyDiePointFinish(spec is map, definition is map, borePoint is map, s
     return spec;
 }
 
-function cutTapLocations(context is Context, id is Id, definition is map, locations is array, pointItems is array, clockItems is array, specifyEnd is boolean, oppositeDefault is boolean, clockOn is boolean, height is ValueWithUnits, tapSpec is map, kind is string, exclude is Query) returns array
+function threadToolKindLabel(spec is map) returns string
 {
+    return threadToolIsDie(spec) ? "External" : "Internal";
+}
+
+function applyLocationFinish(spec is map, definition is map, borePoint is map, specifyEnd is boolean) returns map
+{
+    if (threadToolIsDie(spec))
+    {
+        return applyDiePointFinish(spec, definition, borePoint, specifyEnd);
+    }
+    return applyTapPointFinish(spec, definition, borePoint, specifyEnd);
+}
+
+function growLocationDieEnvelope(context is Context, spec is map, owner is Query) returns map
+{
+    spec.fitThreadOnly = false;
+    if (!isQueryEmpty(context, owner))
+    {
+        spec.outerRadius = max(resolvedDieOuterRadius(spec), radialExtentInCSys(context, owner, spec.localCoordSys) + 0.5 * millimeter);
+    }
+    return spec;
+}
+
+function growLocationDieToFace(spec is map, faceRadius is ValueWithUnits) returns map
+{
+    const envelope = resolvedDieOuterRadius(spec);
+    spec.fitThreadOnly = false;
+    spec.outerRadius = max(envelope, faceRadius + 0.5 * millimeter);
+    return spec;
+}
+
+function clipToolAtStopPlanes(context is Context, id is Id, tool is Query, stopAt, localCoordSys is CoordSystem, height is ValueWithUnits) returns Query
+{
+    if (!(stopAt is Query) || isQueryEmpty(context, stopAt))
+    {
+        return tool;
+    }
+    return clipThreadSweepAtStopPlanes(context, id, tool, stopAt, localCoordSys, height);
+}
+
+function applyPrimaryThreadTool(context is Context, spec is map, primary is map)
+{
+    const faceCSys = primary.coordSystem;
+    const length = primary.length;
+    const stockBodies = evaluateQuery(context, primary.stock);
+    if (size(stockBodies) == 0)
+    {
+        throw regenError("Could not cut the thread from the part.");
+    }
+    const stock = qUnion(stockBodies);
+    var placed = spec;
+    placed.localCoordSys = threadToolCoordSystem(faceCSys, placed);
+    placed = setThreadToolLength(placed, length);
+    if (threadToolIsDie(placed))
+    {
+        placed.fitThreadOnly = true;
+        placed.endChamferAtFarEnd = true;
+    }
+    else
+    {
+        placed.strictCounterbore = true;
+    }
+    var tool = buildPlacedThreadTool(context, primary.featureId + "primary", placed);
+    tool = clipToolAtStopPlanes(context, primary.featureId + "primary", tool, primary.stopAt, faceCSys, length);
+    if (!isQueryEmpty(context, qIntersection([qOwnerBody(tool), stock])))
+    {
+        throw regenError("Could not cut the thread from the part.");
+    }
+    try
+    {
+        opBoolean(context, primary.featureId + "cut", {
+                    "tools" : tool,
+                    "targets" : stock,
+                    "operationType" : BooleanOperationType.SUBTRACTION
+                });
+    }
+    catch
+    {
+        throw regenError("Could not cut the thread from the part.");
+    }
+}
+
+function keepThreadTool(context is Context, definition is map, spec is map, keep is map)
+{
+    const featureId = keep.featureId;
+    const faceCSys = keep.coordSystem;
+    const length = keep.length;
+    const stopAt = keep.stopAt;
+    const namePrefix = threadDisplayName(definition);
+    if (threadToolIsDie(spec))
+    {
+        const dieForm = definition.keptDieForm is KeptDieForm ? definition.keptDieForm : KeptDieForm.THREAD;
+        if (keptDieWantsThread(dieForm))
+        {
+            const dieFrame = oppositeEndThreadFrame(faceCSys, length, spec.pitch, spec.leftHanded == true, spec.alignHalfTurn == true);
+            var savedDie = spec;
+            savedDie.localCoordSys = dieFrame.coordSystem;
+            savedDie.leftHanded = dieFrame.leftHanded;
+            savedDie = setThreadToolLength(savedDie, length);
+            savedDie.fitThreadOnly = true;
+            savedDie.partName = prefixedPartName(definition, "External Die");
+            savedDie.addMate = true;
+            const die = buildPlacedThreadTool(context, featureId + "die", savedDie);
+            clipToolAtStopPlanes(context, featureId + "die", die, stopAt, faceCSys, length);
+        }
+        if (keptDieWantsThrough(dieForm))
+        {
+            const throughDieFrame = oppositeEndThreadFrame(faceCSys, length, spec.pitch, spec.leftHanded == true, spec.alignHalfTurn == true);
+            var throughDie = spec;
+            throughDie.localCoordSys = throughDieFrame.coordSystem;
+            throughDie.leftHanded = throughDieFrame.leftHanded;
+            throughDie = setThreadToolLength(throughDie, definition.maxTapLength);
+            throughDie.fitThreadOnly = true;
+            throughDie.namePrefix = namePrefix;
+            const offset = threadToolIsolateOffset(throughDie.localCoordSys);
+            createThroughDieParts(context, featureId + "throughDie", offsetThreadToolFrame(throughDie, offset));
+            moveThreadToolToPlace(context, featureId + "throughDie" + "toPlace", qCreatedBy(featureId + "throughDie", EntityType.BODY), offset);
+            clipToolAtStopPlanes(context, featureId + "throughDie" + "thread", qCreatedBy(featureId + "throughDie" + "thread", EntityType.BODY), stopAt, faceCSys, length);
+        }
+    }
+    else
+    {
+        const tapForm = definition.keptTapForm is KeptTapForm ? definition.keptTapForm : KeptTapForm.WITH_COUNTERBORE;
+        if (keptTapWantsThread(tapForm))
+        {
+            var savedTap = spec;
+            savedTap.localCoordSys = threadToolCoordSystem(faceCSys, savedTap);
+            savedTap = setThreadToolLength(savedTap, length);
+            savedTap.strictCounterbore = true;
+            savedTap.partName = prefixedPartName(definition, "Internal Tap");
+            savedTap.addMate = true;
+            const tap = buildPlacedThreadTool(context, featureId + "tap", savedTap);
+            clipToolAtStopPlanes(context, featureId + "tap", tap, stopAt, faceCSys, length);
+        }
+        if (keptTapWantsThrough(tapForm))
+        {
+            var throughTap = spec;
+            throughTap.localCoordSys = threadToolCoordSystem(faceCSys, throughTap);
+            throughTap = setThreadToolLength(throughTap, definition.maxTapLength);
+            throughTap.startChamferWidth = throughTapChamferWidth(definition);
+            throughTap.startChamferAngle = throughTapChamferAngle(definition);
+            throughTap.namePrefix = namePrefix;
+            const offset = threadToolIsolateOffset(throughTap.localCoordSys);
+            createThroughTapParts(context, featureId + "throughTap", offsetThreadToolFrame(throughTap, offset));
+            moveThreadToolToPlace(context, featureId + "throughTap" + "toPlace", qCreatedBy(featureId + "throughTap", EntityType.BODY), offset);
+            clipToolAtStopPlanes(context, featureId + "throughTap" + "thread", qCreatedBy(featureId + "throughTap" + "thread", EntityType.BODY), stopAt, faceCSys, length);
+        }
+    }
+}
+
+function applyThreadTool(context is Context, id is Id, definition is map, spec is map, options is map) returns array
+{
+    if (options.primary is map)
+    {
+        applyPrimaryThreadTool(context, spec, options.primary);
+    }
+
     var skipped = [];
+    var ambiguous = [];
+    var primaryStock = heldBodies(context, qOwnerBody(definition.surface));
+    if (isQueryEmpty(context, primaryStock) && options.primary is map && options.primary.stock is Query)
+    {
+        primaryStock = heldBodies(context, options.primary.stock);
+    }
+    else if (isQueryEmpty(context, primaryStock) && options.primaryStock is Query)
+    {
+        primaryStock = heldBodies(context, options.primaryStock);
+    }
+    const locations = options.locations is array ? options.locations : [];
+    const pointItems = options.pointItems is array ? options.pointItems : [];
+    const clockItems = options.clockItems is array ? options.clockItems : [];
+    const specifyEnd = options.specifyEnd == true;
+    const oppositeDefault = options.oppositeDefault == true;
+    const clockOn = options.clockOn == true;
+    const defaultLength = options.defaultLength;
+    const kind = threadToolKindLabel(spec);
     var pointIndex = 0;
     for (var location in locations)
     {
         const label = kind ~ " " ~ (pointIndex + 1);
-        const opId = id + "t" + pointIndex;
+        const opId = id + (threadToolIsDie(spec) ? "d" : "t") + pointIndex;
         try
         {
-            const borePoint = borePointSettingsAt(pointItems, pointIndex, height, oppositeDefault);
+            const borePoint = borePointSettingsAt(pointItems, pointIndex, defaultLength, oppositeDefault);
             const opposite = specifyEnd ? borePoint.pointOpposite : oppositeDefault;
-            const located = borePointLocation(context, location, opposite, exclude);
-            const holeDepth = specifyEnd ? computeBoreDepth(context, borePoint, located, qNothing()) : height;
-            const clockPoint = clockPointSettingsAt(clockItems, pointIndex);
-            const clockAngle = clockOn ? signedClockAngle(clockPoint) : 0 * degree;
-            var holeSpec = applyTapPointFinish(tapSpec, definition, borePoint, specifyEnd);
-            const alignedTap = alignGeneratedPlacement(holeSpec, clockedCoordSystem(located.coordSystem, clockAngle));
-            holeSpec.localCoordSys = alignedTap.coordSystem;
-            holeSpec.leftHanded = alignedTap.leftHanded;
-            holeSpec.tapLength = holeDepth;
-            const tap = createThreadedTap(context, opId, holeSpec);
-            const targets = placementTargets(context, tap, located.owner, exclude);
-            if (isQueryEmpty(context, targets))
+            const located = borePointLocation(context, location, opposite, qNothing(), primaryStock);
+            if (located.ambiguous == true)
             {
-                throw regenError("No part to cut at this location.");
+                ambiguous = append(ambiguous, label);
             }
-            opBoolean(context, opId + "place", {
-                        "tools" : tap,
-                        "targets" : targets,
-                        "operationType" : BooleanOperationType.SUBTRACTION
-                    });
+            else
+            {
+                const owner = located.owner;
+                if (isQueryEmpty(context, owner))
+                {
+                    throw regenError("No part to cut at this location.");
+                }
+                const toolLength = specifyEnd ? computeBoreDepth(context, borePoint, located, qNothing()) : defaultLength;
+                const clockPoint = clockPointSettingsAt(clockItems, pointIndex);
+                const clockAngle = clockOn ? signedClockAngle(clockPoint) : 0 * degree;
+                var holeSpec = applyLocationFinish(spec, definition, borePoint, specifyEnd);
+                const aligned = alignGeneratedPlacement(holeSpec, clockedCoordSystem(located.coordSystem, clockAngle));
+                holeSpec.localCoordSys = aligned.coordSystem;
+                holeSpec.leftHanded = aligned.leftHanded;
+                holeSpec = setThreadToolLength(holeSpec, toolLength);
+                if (threadToolIsDie(holeSpec))
+                {
+                    if (located.faceRadius is ValueWithUnits)
+                    {
+                        holeSpec = growLocationDieToFace(holeSpec, located.faceRadius);
+                    }
+                    else
+                    {
+                        holeSpec = growLocationDieEnvelope(context, holeSpec, owner);
+                    }
+                }
+                const tool = buildPlacedThreadTool(context, opId, holeSpec);
+                subtractCreatedToolFromPart(context, opId, tool, owner);
+            }
         }
         catch
         {
@@ -2618,53 +2752,14 @@ function cutTapLocations(context is Context, id is Id, definition is map, locati
         }
         pointIndex += 1;
     }
-    return skipped;
-}
 
-function cutDieLocations(context is Context, id is Id, definition is map, locations is array, pointItems is array, clockItems is array, specifyEnd is boolean, oppositeDefault is boolean, clockOn is boolean, height is ValueWithUnits, dieSpec is map, kind is string, exclude is Query) returns array
-{
-    var skipped = [];
-    var pointIndex = 0;
-    for (var location in locations)
+    if (options.keep is map)
     {
-        const label = kind ~ " " ~ (pointIndex + 1);
-        const opId = id + "d" + pointIndex;
-        try
-        {
-            const borePoint = borePointSettingsAt(pointItems, pointIndex, height, oppositeDefault);
-            const opposite = specifyEnd ? borePoint.pointOpposite : oppositeDefault;
-            const located = borePointLocation(context, location, opposite, exclude);
-            const dieDepth = specifyEnd ? computeBoreDepth(context, borePoint, located, qNothing()) : height;
-            const clockPoint = clockPointSettingsAt(clockItems, pointIndex);
-            const clockAngle = clockOn ? signedClockAngle(clockPoint) : 0 * degree;
-            var holeSpec = applyDiePointFinish(dieSpec, definition, borePoint, specifyEnd);
-            const alignedDie = alignGeneratedPlacement(holeSpec, clockedCoordSystem(located.coordSystem, clockAngle));
-            holeSpec.localCoordSys = alignedDie.coordSystem;
-            holeSpec.leftHanded = alignedDie.leftHanded;
-            holeSpec.dieLength = dieDepth;
-            holeSpec.fitThreadOnly = false;
-            if (!isQueryEmpty(context, located.owner))
-            {
-                holeSpec.outerRadius = max(resolvedDieOuterRadius(holeSpec), radialExtentInCSys(context, located.owner, holeSpec.localCoordSys) + 0.5 * millimeter);
-            }
-            const die = createThreadedDie(context, opId, holeSpec);
-            const targets = placementTargets(context, die, located.owner, exclude);
-            if (isQueryEmpty(context, targets))
-            {
-                throw regenError("No part to cut at this location.");
-            }
-            opBoolean(context, opId + "place", {
-                        "tools" : die,
-                        "targets" : targets,
-                        "operationType" : BooleanOperationType.SUBTRACTION
-                    });
-        }
-        catch
-        {
-            deleteCreatedSilent(context, opId);
-            skipped = append(skipped, label);
-        }
-        pointIndex += 1;
+        keepThreadTool(context, definition, spec, options.keep);
+    }
+    if (size(ambiguous) > 0)
+    {
+        reportFeatureWarning(context, options.featureId, "Skipped locations that match more than one part: " ~ joinLabels(ambiguous) ~ ".");
     }
     return skipped;
 }
@@ -2812,16 +2907,6 @@ export const printableThread = defineFeature(function(context is Context, id is 
         annotation { "Name" : "Unified finishes", "UIHint" : UIHint.ALWAYS_HIDDEN, "Default" : false }
         definition.unifiedFinishes is boolean;
 
-        annotation { "Name" : "Mating thread", "UIHint" : UIHint.ALWAYS_HIDDEN, "Default" : false }
-        definition.boreMatingPart is boolean;
-
-        annotation {
-            "Name" : "Parts",
-            "UIHint" : UIHint.ALWAYS_HIDDEN,
-            "Filter" : EntityType.BODY && BodyType.SOLID && SketchObject.NO && ConstructionObject.NO && ModifiableEntityOnly.YES
-        }
-        definition.boreParts is Query;
-
         annotation { "Name" : "Hole counterbore", "UIHint" : UIHint.ALWAYS_HIDDEN, "Default" : false }
         definition.holeCounterbore is boolean;
 
@@ -2914,29 +2999,29 @@ export const printableThread = defineFeature(function(context is Context, id is 
 
         annotation {
             "Name" : "Thread clearance",
-            "Description" : "Radial offset applied only to the mating thread tool. The initial surface stays exact."
+            "Description" : "Radial offset applied only to the Mating thread tool. The Primary thread stays exact."
         }
         isLength(definition.threadClearance, PRINTABLE_THREAD_CLEARANCE_BOUNDS);
 
-        annotation { "Name" : "Initial thread", "UIHint" : UIHint.READ_ONLY }
+        annotation { "Name" : "Primary thread", "UIHint" : UIHint.READ_ONLY }
         definition.generatedRole is string;
 
         annotation {
-            "Name" : "Initial locations",
-            "Description" : "Sketch points or mate connectors for more threads of the initial type.",
-            "Filter" : EntityType.VERTEX && SketchObject.YES && ModifiableEntityOnly.YES || BodyType.MATE_CONNECTOR
+            "Name" : "Matching locations",
+            "Description" : "Sketch points, mate connectors, cylindrical or conical faces, or pin or boss end faces for more threads of the same type as the Primary thread.",
+            "Filter" : EntityType.VERTEX && SketchObject.YES && ModifiableEntityOnly.YES || BodyType.MATE_CONNECTOR || EntityType.FACE && SketchObject.NO && ConstructionObject.NO && ModifiableEntityOnly.YES && (QueryFilterCompound.ALLOWS_AXIS || QueryFilterCompound.ALLOWS_PLANE)
         }
         definition.generatedLocations is Query;
 
-        annotation { "Name" : "Configure initial locations", "Default" : false }
+        annotation { "Name" : "Configure matching locations", "Default" : false }
         definition.specifyGeneratedEnd is boolean;
 
         if (definition.specifyGeneratedEnd)
         {
-            annotation { "Group Name" : "Initial locations", "Collapsed By Default" : false, "Driving Parameter" : "specifyGeneratedEnd" }
+            annotation { "Group Name" : "Matching locations", "Collapsed By Default" : false, "Driving Parameter" : "specifyGeneratedEnd" }
             {
                 annotation {
-                    "Name" : "Initial locations",
+                    "Name" : "Matching locations",
                     "Item name" : "Location",
                     "Driven query" : "genLocation",
                     "Item label template" : "#genLocation - #genEndType",
@@ -2947,7 +3032,7 @@ export const printableThread = defineFeature(function(context is Context, id is 
                 {
                     annotation {
                         "Name" : "Location",
-                        "Filter" : EntityType.VERTEX && SketchObject.YES && ModifiableEntityOnly.YES || BodyType.MATE_CONNECTOR,
+                        "Filter" : EntityType.VERTEX && SketchObject.YES && ModifiableEntityOnly.YES || BodyType.MATE_CONNECTOR || EntityType.FACE && SketchObject.NO && ConstructionObject.NO && ModifiableEntityOnly.YES && (QueryFilterCompound.ALLOWS_AXIS || QueryFilterCompound.ALLOWS_PLANE),
                         "MaxNumberOfPicks" : 1,
                         "UIHint" : UIHint.ALWAYS_HIDDEN
                     }
@@ -3026,25 +3111,19 @@ export const printableThread = defineFeature(function(context is Context, id is 
             }
         }
 
-        if (definition.specifyGeneratedEnd != true)
-        {
-            annotation { "Name" : "Initial opposite direction", "UIHint" : UIHint.OPPOSITE_DIRECTION, "Default" : false }
-            definition.generatedOpposite is boolean;
-        }
-
         annotation {
-            "Name" : "Clock initial threads",
-            "Description" : "Rotate each initial-type cutter around its axis.",
+            "Name" : "Clock matching threads",
+            "Description" : "Rotate each Matching location around its axis.",
             "Default" : false
         }
         definition.clockGenerated is boolean;
 
         if (definition.clockGenerated)
         {
-            annotation { "Group Name" : "Initial clock", "Collapsed By Default" : false, "Driving Parameter" : "clockGenerated" }
+            annotation { "Group Name" : "Matching clock", "Collapsed By Default" : false, "Driving Parameter" : "clockGenerated" }
             {
                 annotation {
-                    "Name" : "Initial clock",
+                    "Name" : "Matching clock",
                     "Item name" : "Location",
                     "Driven query" : "genClockLocation",
                     "Item label template" : "#genClockLocation - #genClockAngle #genClockSense",
@@ -3055,7 +3134,7 @@ export const printableThread = defineFeature(function(context is Context, id is 
                 {
                     annotation {
                         "Name" : "Location",
-                        "Filter" : EntityType.VERTEX && SketchObject.YES && ModifiableEntityOnly.YES || BodyType.MATE_CONNECTOR,
+                        "Filter" : EntityType.VERTEX && SketchObject.YES && ModifiableEntityOnly.YES || BodyType.MATE_CONNECTOR || EntityType.FACE && SketchObject.NO && ConstructionObject.NO && ModifiableEntityOnly.YES && (QueryFilterCompound.ALLOWS_AXIS || QueryFilterCompound.ALLOWS_PLANE),
                         "MaxNumberOfPicks" : 1,
                         "UIHint" : UIHint.ALWAYS_HIDDEN
                     }
@@ -3084,8 +3163,8 @@ export const printableThread = defineFeature(function(context is Context, id is 
 
         annotation {
             "Name" : "Mating locations",
-            "Description" : "Sketch points or mate connectors for the mating thread.",
-            "Filter" : EntityType.VERTEX && SketchObject.YES && ModifiableEntityOnly.YES || BodyType.MATE_CONNECTOR
+            "Description" : "Sketch points, mate connectors, cylindrical or conical faces, or pin or boss end faces for the mating thread.",
+            "Filter" : EntityType.VERTEX && SketchObject.YES && ModifiableEntityOnly.YES || BodyType.MATE_CONNECTOR || EntityType.FACE && SketchObject.NO && ConstructionObject.NO && ModifiableEntityOnly.YES && (QueryFilterCompound.ALLOWS_AXIS || QueryFilterCompound.ALLOWS_PLANE)
         }
         definition.boreLocations is Query;
 
@@ -3108,7 +3187,7 @@ export const printableThread = defineFeature(function(context is Context, id is 
                 {
                     annotation {
                         "Name" : "Location",
-                        "Filter" : EntityType.VERTEX && SketchObject.YES && ModifiableEntityOnly.YES || BodyType.MATE_CONNECTOR,
+                        "Filter" : EntityType.VERTEX && SketchObject.YES && ModifiableEntityOnly.YES || BodyType.MATE_CONNECTOR || EntityType.FACE && SketchObject.NO && ConstructionObject.NO && ModifiableEntityOnly.YES && (QueryFilterCompound.ALLOWS_AXIS || QueryFilterCompound.ALLOWS_PLANE),
                         "MaxNumberOfPicks" : 1,
                         "UIHint" : UIHint.ALWAYS_HIDDEN
                     }
@@ -3187,12 +3266,6 @@ export const printableThread = defineFeature(function(context is Context, id is 
             }
         }
 
-        if (definition.specifyBoreEnd != true)
-        {
-            annotation { "Name" : "Mating opposite direction", "UIHint" : UIHint.OPPOSITE_DIRECTION, "Default" : false }
-            definition.boreOppositeDirection is boolean;
-        }
-
         annotation {
             "Name" : "Clock mating threads",
             "Description" : "Rotate each mating cutter around its axis to correct printed thread engagement.",
@@ -3216,7 +3289,7 @@ export const printableThread = defineFeature(function(context is Context, id is 
                 {
                     annotation {
                         "Name" : "Location",
-                        "Filter" : EntityType.VERTEX && SketchObject.YES && ModifiableEntityOnly.YES || BodyType.MATE_CONNECTOR,
+                        "Filter" : EntityType.VERTEX && SketchObject.YES && ModifiableEntityOnly.YES || BodyType.MATE_CONNECTOR || EntityType.FACE && SketchObject.NO && ConstructionObject.NO && ModifiableEntityOnly.YES && (QueryFilterCompound.ALLOWS_AXIS || QueryFilterCompound.ALLOWS_PLANE),
                         "MaxNumberOfPicks" : 1,
                         "UIHint" : UIHint.ALWAYS_HIDDEN
                     }
@@ -3283,7 +3356,7 @@ export const printableThread = defineFeature(function(context is Context, id is 
                     "value" : treeName
                 });
         const face = requireThreadFace(context, definition.surface);
-        var part = qOwnerBody(face);
+        var part = qOwnerBody(definition.surface);
         const frame = threadSurfaceFrame(context, face, false);
         addManipulators(context, id, {
                     (DIRECTION_MANIPULATOR) : flipManipulator({
@@ -3341,99 +3414,15 @@ export const printableThread = defineFeature(function(context is Context, id is 
         }
 
         const startPoint = toWorld(localCoordSys, vector(oriented.startRadius, 0 * meter, 0 * meter));
-        const cutsInward = threadCutsInward(context, face, localCoordSys, startPoint);
-        const primaryIsInternal = !cutsInward;
-
-        if (definition.chamferEnd && !primaryIsInternal)
-        {
-            if (definition.chamferWidth >= height)
-            {
-                throw regenError("Chamfer is larger than the surface length.", ["chamferWidth"]);
-            }
-            if (definition.chamferWidth >= smallestRadius)
-            {
-                throw regenError("Chamfer is larger than the surface radius.", ["chamferWidth"]);
-            }
-
-            const endEdges = directedEndEdges(context, face, localCoordSys, height);
-            try
-            {
-                opChamfer(context, id + "chamfer", {
-                            "entities" : endEdges,
-                            "chamferType" : ChamferType.OFFSET_ANGLE,
-                            "width" : definition.chamferWidth,
-                            "angle" : definition.chamferAngle,
-                            "oppositeDirection" : chamferWidthOnFace(context, endEdges, face)
-                        });
-            }
-            catch
-            {
-                throw regenError("Could not chamfer the directed end.", ["chamferWidth", "chamferAngle"]);
-            }
-            part = qOwnerBody(qCreatedBy(id + "chamfer", EntityType.FACE));
-        }
-
+        const primaryIsInternal = !threadCutsInward(context, face, localCoordSys, startPoint);
         const overlap = max(pitch * 0.02, 0.02 * millimeter);
         const halfWidths = threadProfileHalfWidths(overlap, depth, truncation, definition.wallAngle);
         const outerHalfWidth = halfWidths.outerHalfWidth;
         const rootHalfWidth = halfWidths.rootHalfWidth;
         const extraRevs = outerHalfWidth / pitch + 0.25;
-
-        var sweepTool = createHelicalGroove(context, id, {
-                    "localCoordSys" : localCoordSys,
-                    "length" : height,
-                    "helixStartRadius" : oriented.startRadius,
-                    "helixEndRadius" : oriented.endRadius,
-                    "cutsInward" : cutsInward,
-                    "clipToFace" : primaryIsInternal,
-                    "lockFrom" : face,
-                    "pitch" : pitch,
-                    "depth" : depth,
-                    "truncation" : truncation,
-                    "overlap" : overlap,
-                    "outerHalfWidth" : outerHalfWidth,
-                    "rootHalfWidth" : rootHalfWidth,
-                    "leftHanded" : definition.leftHanded == true
-                });
-        if (definition.stopAt is Query && !isQueryEmpty(context, definition.stopAt))
-        {
-            sweepTool = clipThreadSweepAtStopPlanes(context, id, sweepTool, definition.stopAt, localCoordSys, height);
-        }
-
-        touchLegacyPartPickHelpers(context, id + "legacy", qNothing(), localCoordSys, height);
+        const definedLength = definedThreadLength(context, definition.stopAt, localCoordSys, height);
         const matingClearance = definition.threadClearance is ValueWithUnits ? definition.threadClearance : 0 * meter;
-        const tapClearance = primaryIsInternal ? 0 * meter : matingClearance;
-        const dieClearance = primaryIsInternal ? matingClearance : 0 * meter;
-        var exactTap = tapSpecFromDefinition(definition, oriented, height, pitch, overlap, extraRevs, outerHalfWidth, rootHalfWidth, truncation, depth, primaryIsInternal != true, tapClearance);
-        exactTap.generatorCSys = localCoordSys;
-        exactTap.alignHalfTurn = false;
-        const matingTap = tapSpecFromDefinition(definition, oriented, height, pitch, overlap, extraRevs, outerHalfWidth, rootHalfWidth, truncation, depth, true, matingClearance);
-        var exactDie = dieSpecFromDefinition(definition, oriented, height, pitch, overlap, extraRevs, outerHalfWidth, rootHalfWidth, truncation, depth, dieClearance);
-        exactDie.matchExternal = primaryIsInternal != true;
-        exactDie.generatorCSys = localCoordSys;
-        exactDie.alignHalfTurn = false;
-        const matingDie = dieSpecFromDefinition(definition, oriented, height, pitch, overlap, extraRevs, outerHalfWidth, rootHalfWidth, truncation, depth, matingClearance);
-        try
-        {
-            opBoolean(context, id + "cut", {
-                        "tools" : sweepTool,
-                        "targets" : part,
-                        "operationType" : BooleanOperationType.SUBTRACTION
-                    });
-        }
-        catch
-        {
-            throw regenError("Could not cut the thread from the part.");
-        }
-        const cutPart = qOwnerBody(qCreatedBy(id + "cut", EntityType.FACE));
-        if (!isQueryEmpty(context, cutPart))
-        {
-            part = cutPart;
-        }
-        if (primaryIsInternal)
-        {
-            applyInternalHoleFinish(context, id, definition, part, localCoordSys, oriented.startRadius, oriented.endRadius, height, depth);
-        }
+        const tools = threadToolSpecs(definition, oriented, height, pitch, overlap, extraRevs, outerHalfWidth, rootHalfWidth, truncation, depth, primaryIsInternal, matingClearance, localCoordSys);
 
         const generatedLocations = queryLocations(context, definition.generatedLocations);
         const matingLocations = queryLocations(context, definition.boreLocations);
@@ -3441,82 +3430,58 @@ export const printableThread = defineFeature(function(context is Context, id is 
         const generatedClockItems = definition.clockGenerated == true && definition.generatedClockPoints is array ? generatedClocksAsClockPoints(definition.generatedClockPoints) : [];
         const matingPointItems = definition.specifyBoreEnd == true && definition.borePoints is array ? definition.borePoints : [];
         const matingClockItems = definition.clockBores == true && definition.clockPoints is array ? definition.clockPoints : [];
-        var skipped = [];
-        if (primaryIsInternal)
+        var matchingOptions = {
+                    "locations" : generatedLocations,
+                    "pointItems" : generatedPointItems,
+                    "clockItems" : generatedClockItems,
+                    "specifyEnd" : definition.specifyGeneratedEnd == true,
+                    "oppositeDefault" : false,
+                    "clockOn" : definition.clockGenerated == true,
+                    "defaultLength" : definedLength,
+                    "featureId" : id,
+                    "primary" : {
+                        "featureId" : id,
+                        "stock" : part,
+                        "coordSystem" : localCoordSys,
+                        "length" : definedLength,
+                        "stopAt" : definition.stopAt
+                    }
+                };
+        var matingOptions = {
+                    "locations" : matingLocations,
+                    "pointItems" : matingPointItems,
+                    "clockItems" : matingClockItems,
+                    "specifyEnd" : definition.specifyBoreEnd == true,
+                    "oppositeDefault" : false,
+                    "clockOn" : definition.clockBores == true,
+                    "defaultLength" : definedLength,
+                    "featureId" : id,
+                    "primaryStock" : part
+                };
+        if (definition.makeTap == true)
         {
-            for (var label in cutTapLocations(context, id + "gen", definition, generatedLocations, generatedPointItems, generatedClockItems, definition.specifyGeneratedEnd == true, definition.generatedOpposite == true, definition.clockGenerated == true, height, exactTap, "Internal", part))
-            {
-                skipped = append(skipped, label);
-            }
-            for (var label in cutDieLocations(context, id + "mate", definition, matingLocations, matingPointItems, matingClockItems, definition.specifyBoreEnd == true, definition.boreOppositeDirection == true, definition.clockBores == true, height, matingDie, "External", part))
-            {
-                skipped = append(skipped, label);
-            }
+            const keep = {
+                        "featureId" : id,
+                        "coordSystem" : localCoordSys,
+                        "length" : definedLength,
+                        "stopAt" : definition.stopAt
+                    };
+            matchingOptions.keep = keep;
+            matingOptions.keep = keep;
         }
-        else
+
+        var skipped = [];
+        for (var label in applyThreadTool(context, id + "gen", definition, tools.matching, matchingOptions))
         {
-            for (var label in cutDieLocations(context, id + "gen", definition, generatedLocations, generatedPointItems, generatedClockItems, definition.specifyGeneratedEnd == true, definition.generatedOpposite == true, definition.clockGenerated == true, height, exactDie, "External", part))
-            {
-                skipped = append(skipped, label);
-            }
-            for (var label in cutTapLocations(context, id + "mate", definition, matingLocations, matingPointItems, matingClockItems, definition.specifyBoreEnd == true, definition.boreOppositeDirection == true, definition.clockBores == true, height, matingTap, "Internal", part))
-            {
-                skipped = append(skipped, label);
-            }
+            skipped = append(skipped, label);
+        }
+        for (var label in applyThreadTool(context, id + "mate", definition, tools.complementary, matingOptions))
+        {
+            skipped = append(skipped, label);
         }
         if (size(skipped) > 0)
         {
             reportFeatureWarning(context, id, "Skipped locations that could not be cut: " ~ joinLabels(skipped) ~ ".");
-        }
-
-        if (definition.makeTap == true)
-        {
-            const tapForm = definition.keptTapForm is KeptTapForm ? definition.keptTapForm : KeptTapForm.WITH_COUNTERBORE;
-            const dieForm = definition.keptDieForm is KeptDieForm ? definition.keptDieForm : KeptDieForm.THREAD;
-            const namePrefix = threadDisplayName(definition);
-            if (keptTapWantsThread(tapForm))
-            {
-                var savedTap = exactTap;
-                savedTap.localCoordSys = threadToolCoordSystem(localCoordSys, savedTap);
-                savedTap.tapLength = height;
-                savedTap.strictCounterbore = true;
-                savedTap.partName = prefixedPartName(definition, "Internal Tap");
-                savedTap.addMate = true;
-                createThreadedTap(context, id + "tap", savedTap);
-            }
-            if (keptTapWantsThrough(tapForm))
-            {
-                var throughTap = exactTap;
-                throughTap.localCoordSys = threadToolCoordSystem(localCoordSys, throughTap);
-                throughTap.tapLength = definition.maxTapLength;
-                throughTap.startChamferWidth = throughTapChamferWidth(definition);
-                throughTap.startChamferAngle = throughTapChamferAngle(definition);
-                throughTap.namePrefix = namePrefix;
-                createThroughTapParts(context, id + "throughTap", throughTap);
-            }
-            if (keptDieWantsThread(dieForm))
-            {
-                const dieFrame = oppositeEndThreadFrame(localCoordSys, height, pitch, exactDie.leftHanded == true, exactDie.alignHalfTurn == true);
-                var savedDie = exactDie;
-                savedDie.localCoordSys = dieFrame.coordSystem;
-                savedDie.leftHanded = dieFrame.leftHanded;
-                savedDie.dieLength = height;
-                savedDie.fitThreadOnly = true;
-                savedDie.partName = prefixedPartName(definition, "External Die");
-                savedDie.addMate = true;
-                createThreadedDie(context, id + "die", savedDie);
-            }
-            if (keptDieWantsThrough(dieForm))
-            {
-                const throughDieFrame = oppositeEndThreadFrame(localCoordSys, height, pitch, exactDie.leftHanded == true, exactDie.alignHalfTurn == true);
-                var throughDie = exactDie;
-                throughDie.localCoordSys = throughDieFrame.coordSystem;
-                throughDie.leftHanded = throughDieFrame.leftHanded;
-                throughDie.dieLength = definition.maxTapLength;
-                throughDie.fitThreadOnly = true;
-                throughDie.namePrefix = namePrefix;
-                createThroughDieParts(context, id + "throughDie", throughDie);
-            }
         }
     }, {
             "name" : "Printable Thread",
@@ -3541,8 +3506,8 @@ export const printableThread = defineFeature(function(context is Context, id is 
             "dieOuterRadius" : 20 * millimeter,
             "keptTapForm" : KeptTapForm.WITH_COUNTERBORE,
             "keptDieForm" : KeptDieForm.THREAD,
-            "generatedRole" : "Initial",
-            "matingRole" : "Mating",
+            "generatedRole" : "Primary thread",
+            "matingRole" : "Mating thread",
             "threadClearance" : 0.2 * millimeter,
             "holeCounterboreDeeper" : 1 * millimeter,
             "holeCounterboreBack" : 2 * millimeter,
